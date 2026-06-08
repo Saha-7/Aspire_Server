@@ -1,7 +1,6 @@
 'use strict';
  
 require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env') });
- 
 const { runScheduler } = require('../../src/scheduler/index');
  
 module.exports = async function (context, myTimer) {
