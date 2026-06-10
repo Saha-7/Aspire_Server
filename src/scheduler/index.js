@@ -78,10 +78,10 @@ async function loadCategorySchedule(pool) {
   const result = await pool.request().query(`
     SELECT
       ip.Category,
-      MAX(ip.NextScrapDueAt)     AS NextScrapDueAt,
-      MAX(ip.LastScrapedAt)      AS LastScrapedAt,
-      MAX(cs.ScrapFreqDays)      AS ScrapFreqDays,
-      MAX(cs.IsScrapEnabled)     AS IsScrapEnabled
+      MAX(ip.NextScrapDueAt)                        AS NextScrapDueAt,
+      MAX(ip.LastScrapedAt)                         AS LastScrapedAt,
+      MAX(cs.ScrapFreqDays)                         AS ScrapFreqDays,
+      CAST(MAX(CAST(cs.IsScrapEnabled AS INT)) AS BIT) AS IsScrapEnabled
     FROM InternalProducts ip
     LEFT JOIN CategorySettings cs ON cs.CategoryName = ip.Category
     WHERE ip.Category IS NOT NULL
