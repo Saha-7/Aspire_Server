@@ -21,14 +21,14 @@ const STORES = [
       { slug: 'graphic-cards', url: 'https://www.primeabgb.com/buy-online-price-india/graphic-cards-gpu/' },
       { slug: 'monitors', url: 'https://www.primeabgb.com/buy-online-price-india/led-monitors/'},
       { slug: 'hdd', url: 'https://www.primeabgb.com/buy-online-price-india/internal-hard-drive/' },
-     { slug: 'ssd', url: 'https://www.primeabgb.com/buy-online-price-india/ssd/' },
-        { slug: 'smps', url: 'https://www.primeabgb.com/buy-online-price-india/power-supplies-smps/'},
-        { slug: 'gaming-routers', url: 'https://www.primeabgb.com/buy-online-price-india/gaming-wireless-routers/'},
-        { slug: 'gaming-headset', url: 'https://www.primeabgb.com/buy-online-price-india/gaming-headset/'},
+      { slug: 'ssd', url: 'https://www.primeabgb.com/buy-online-price-india/ssd/' },
+      { slug: 'smps', url: 'https://www.primeabgb.com/buy-online-price-india/power-supplies-smps/'},
+      { slug: 'gaming-routers', url: 'https://www.primeabgb.com/buy-online-price-india/gaming-wireless-routers/'},
+      { slug: 'gaming-headset', url: 'https://www.primeabgb.com/buy-online-price-india/gaming-headset/'},
 
-        { slug: 'cpu-cooler', url: 'https://www.primeabgb.com/buy-online-price-india/cpu-cooler/'},
-        { slug: 'pc-case-cabinets', url: 'https://www.primeabgb.com/buy-online-price-india/pc-cases-cabinet/'},
-        { slug: 'nas', url: 'https://www.primeabgb.com/buy-online-price-india/network-attached-storage-nas/'},
+      { slug: 'cpu-cooler', url: 'https://www.primeabgb.com/buy-online-price-india/cpu-cooler/'},
+      { slug: 'pc-case-cabinets', url: 'https://www.primeabgb.com/buy-online-price-india/pc-cases-cabinet/'},
+      { slug: 'nas', url: 'https://www.primeabgb.com/buy-online-price-india/network-attached-storage-nas/'},
       
     ],
   },
@@ -55,19 +55,6 @@ const STORES = [
     ],
   },
 
-  // {
-  //   name  : 'pickpcparts',
-  //   parser: require('./parsers/pickpcparts'),
-  //   categories: [
-  //     { slug: 'cpu-processor', url: 'https://pickpcparts.in/processors/' },
-  //     { slug: 'ram-memory',    url: 'https://pickpcparts.in/rams/' },
-  //     // { slug: 'motherboards',  url: 'https://pickpcparts.in/motherboards/' },
-  //     // { slug: 'graphic-cards', url: 'https://pickpcparts.in/graphics_cards/' },
-  //     // { slug: 'storages',      url: 'https://pickpcparts.in/storages/' },
-  //     // { slug: 'keyboards',     url: 'https://pickpcparts.in/keyboards/' },
-  //     // { slug: 'mice',          url: 'https://pickpcparts.in/mice/' },
-  //   ],
-  // },
 
   {
     name: "vedant",
@@ -78,6 +65,18 @@ const STORES = [
       { slug: "graphic-cards", url:"https://www.vedantcomputers.com/pc-components/gpu"},
       { slug: "ssd", url: "https://www.vedantcomputers.com/pc-components/storage/solid-state-drive"},
       { slug: "hdd", url: "https://www.vedantcomputers.com/pc-components/storage/hard-disk-drive"},
+      { slug: "motherboards", url: "https://www.vedantcomputers.com/pc-components/motherboard"},
+      { slug: "power-supply", url: "https://www.vedantcomputers.com/pc-components/smps"},
+      { slug: "ssd", url: "https://www.vedantcomputers.com/pc-components/storage/solid-state-drive"},
+      { slug: "hdd", url: "https://www.vedantcomputers.com/pc-components/storage/hard-disk-drive"},
+      { slug: "cpu-cooler", url: "https://www.vedantcomputers.com/pc-components/cpu-cooler"},
+
+      { slug: "cabinet", url: "https://www.vedantcomputers.com/pc-components/cabinet"},
+      { slug: "case-fan", url: "https://www.vedantcomputers.com/pc-components/cooling-accessories/case-fan"},
+      { slug: "thermal-paste", url: "https://www.vedantcomputers.com/pc-components/cooling-accessories/thermal-paste"},
+      { slug: "cooling-brackets", url: "https://www.vedantcomputers.com/pc-components/cooling-accessories/cooler-brackets"},
+       { slug: "laptop-cooler", url: "https://www.vedantcomputers.com/pc-components/cooling-accessories/laptop-cooler"},
+
     ],
   },
 
@@ -87,30 +86,18 @@ const STORES = [
     categories: [
       { slug: "cpu-processor", url: "https://vishalperipherals.com/collections/processors" },
       { slug: "ram-memory", url: "https://vishalperipherals.com/collections/ram" },
-      { slug: "graphic-cards", url: "https://vishalperipherals.com/collections/graphic-cards"}
+      { slug: "graphic-cards", url: "https://vishalperipherals.com/collections/graphic-cards"},
+      { slug: "cabinet", url: "https://vishalperipherals.com/collections/cabinets"},
+      { slug: "motherboards", url: "https://vishalperipherals.com/collections/motherboards"},
+      { slug: "ssd", url: "https://vishalperipherals.com/collections/solid-state-drive-ssd"},
+      { slug: "hdd", url: "https://vishalperipherals.com/collections/hard-disk"},
+      { slug: "power-supply", url: "https://vishalperipherals.com/collections/power-supply" },
+      { slug: "coolers", url: "https://vishalperipherals.com/collections/gaming-coolers"},
+      { slug: "monitors", url: "https://vishalperipherals.com/collections/monitors"},
     ],
   },
 
-  // {
-  //   name  : 'computechstore',
-  //   parser: require('./parsers/computechstore'),
-  //   categories: [
-  //     {
-  //       slug: 'cpu-processor',
-  //       url : 'https://computechstore.in/product-category/processor'
-  //     },
-  //   ],
-  // },
-
-  // To add a new store Example:
-  // {
-  //   name  : 'vedant',
-  //   parser: require('./parsers/vedant'),
-  //   categories: [
-  //     { slug: 'cpu-processor', url: 'https://www.vedantcomputers.com/...' },
-  //   ],
-  // },
-
+  
   {
     name: "pcstudio",
     parser: require("./parsers/pcstudio"),
@@ -119,12 +106,12 @@ const STORES = [
       { slug: "ram-memory", url: "https://www.pcstudio.in/product-category/ram/",},
       {slug: "monitors", url: "https://www.pcstudio.in/product-category/monitor/"},
       { slug: "storage", url: "https://www.pcstudio.in/product-category/storage/" },
-      { slug: "graphic-cards", url: "https://www.pcstudio.in/product-category/graphics-card/"},
+      { slug: "graphics-card", url: "https://www.pcstudio.in/product-category/graphics-card/"},
       {slug: "motherboard", url: "https://www.pcstudio.in/product-category/motherboard/"},
       { slug: "cabinets", url: "https://www.pcstudio.in/product-category/cabinets/"},
 
       { slug: "power-supply", url: "https://www.pcstudio.in/product-category/power-supply/" },
-      { slug: "cpu-cooler", url: "https://www.pcstudio.in/product-category/cooling-solutions/" },
+      { slug: "cpu-cooler", url: "https://www.pcstudio.in/product-category/cpu-cooler/" },
       {slug: "cabinet-fans", url: "https://www.pcstudio.in/product-category/cabinet-fan/"}
     ],
   },

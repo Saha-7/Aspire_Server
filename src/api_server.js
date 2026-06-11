@@ -499,17 +499,21 @@ app.post('/api/validate-skus', requireAuth, async (req, res) => {
       WHERE SKU_ID IN (${paramNames.join(',')})
     `);
 
+    // FIX: normalize keys to lowercase.
+    // SQL Server finds the row case-insensitively, but JavaScript Map
+    // is case-sensitive — so "I5-12400F" and "i5-12400F" would be
+    // treated as different keys without this normalization.
     const foundMap = new Map();
     for (const row of result.recordset) {
-      foundMap.set(row.SKU_ID, row.PP != null ? parseFloat(row.PP) : null);
+      foundMap.set(row.SKU_ID.toLowerCase(), row.PP != null ? parseFloat(row.PP) : null);
     }
 
     const valid    = [];
     const notFound = [];
 
     for (const sku of skus) {
-      if (foundMap.has(sku)) {
-        valid.push({ sku, currentPP: foundMap.get(sku) });
+      if (foundMap.has(sku.toLowerCase())) {
+        valid.push({ sku, currentPP: foundMap.get(sku.toLowerCase()) });
       } else {
         notFound.push(sku);
       }
