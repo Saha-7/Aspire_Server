@@ -1,17 +1,22 @@
 // src/scheduler/index.js
+// ─────────────────────────────────────────────────────────────
+// PHASE 1 REWRITE — fixes:
 //
-// CHANGES in this version:
-//   1. runScheduler() now accepts an optional `options` object:
-//        { log: Function, isCancelled: Function }
-//      - log(message)       : custom logger — used instead of console.log so
-//                             api_server.js can capture lines for the UI log panel.
-//                             Falls back to console.log if not provided.
-//      - isCancelled()      : called between categories — if it returns true,
-//                             the scheduler stops cleanly after the current category
-//                             finishes. Never stops mid-category (safe, no data loss).
-//   2. All console.log calls inside runScheduler replaced with logger(message).
-//   3. Manual run (node src/scheduler/index.js) unchanged — options not passed,
-//      so it falls back to console.log and never cancels.
+//  FIX 1: findStoreConfig() replaced with explicit SCRAPER_CONFIG array.
+//         No fuzzy .includes() matching. Each entry maps an exact
+//         InternalProducts.Category name → store name → slug in urls.js.
+//         Wrong store bug eliminated entirely.
+//
+//  FIX 2: NextScrapDueAt is only updated when result.saved > 0.
+//         A 0-product scrape no longer locks out a category for 7 days.
+//
+//  FIX 3: runCleanupMapper() validates COSMOS_CONNECTION_STRING before
+//         touching CosmosClient. Missing env var no longer crashes the
+//         entire scheduler run.
+//
+//  FIX 4: Removed noisy "no store config found" log for every one of
+//         the 179 Shopify-only categories that have no scraper.
+//         Scheduler only logs categories it actually processes.
 // ─────────────────────────────────────────────────────────────
 
 require('dotenv').config();
@@ -26,22 +31,166 @@ const { scrapeCategory }       = require('../scraper/index');
 const { upsertManyFromCosmos } = require('../services/competitorPriceService');
 const { getPaths }             = require('../scraper/fileHelpers');
 
-// ── System-wide default frequencies (days) ───────────────────
-const DEFAULT_FREQUENCIES = {
-  'Processor' : 7,
-  'RAM'       : 7,
-  'SSD'       : 7,
-  'HDD'       : 7,
-  'Storage'   : 7,
-  'DEFAULT'   : 7,
-};
+// ─────────────────────────────────────────────────────────────
+// SCRAPER_CONFIG
+// ─────────────────────────────────────────────────────────────
+// This is the single source of truth for what gets scraped.
+//
+// Each entry:
+//   categoryName  — exact value from InternalProducts.Category (case-sensitive)
+//   storeName     — exact store name from urls.js STORES array
+//   slug          — exact category slug from that store's categories array
+//
+// IMPORTANT: Run this SQL to check your exact category names:
+//   SELECT DISTINCT Category FROM InternalProducts
+//   WHERE isActive = 1 ORDER BY Category
+//
+// Then match them here. If a category name in your DB is "Graphics Card"
+// (with space, capital G and C), it must be written exactly that way here.
+//
+// To add a new category: add one object to this array. No other code changes.
+// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// SCRAPER_CONFIG
+// Cross-referenced against:
+//   - list11.txt  (exact InternalProducts.Category values from DB)
+//   - urls.js     (exact store names + slugs)
+//
+// Rules followed:
+//   1. categoryName = exact string from DB (copy-pasted, no guessing)
+//   2. For categories scraped from MULTIPLE stores, one entry per store
+//      so you get competitor prices from all of them
+//   3. Categories in DB with NO matching scraper are simply omitted
+//   4. Duplicate slugs in vedant (ssd x2, hdd x2) — used only once
+// ─────────────────────────────────────────────────────────────
+const SCRAPER_CONFIG = [
 
-function getDefaultFrequency(categoryName) {
-  const key = Object.keys(DEFAULT_FREQUENCIES).find(
-    k => k.toLowerCase() === (categoryName || '').toLowerCase()
-  );
-  return DEFAULT_FREQUENCIES[key] || DEFAULT_FREQUENCIES['DEFAULT'];
-}
+  // ── Processor ───────────────────────────────────────────────
+  // DB: "Processor" | Scraped from all 5 stores
+  { categoryName: 'Processor', storeName: 'primeabgb',   slug: 'cpu-processor'  },
+  { categoryName: 'Processor', storeName: 'mdcomputers', slug: 'cpu-processor'  },
+  { categoryName: 'Processor', storeName: 'vedant',      slug: 'cpu-processor'  },
+  { categoryName: 'Processor', storeName: 'vishal',      slug: 'cpu-processor'  },
+  { categoryName: 'Processor', storeName: 'pcstudio',    slug: 'cpu-processor'  },
+
+  // ── RAM ─────────────────────────────────────────────────────
+  // DB: "RAM" | Scraped from all 5 stores
+  { categoryName: 'RAM', storeName: 'primeabgb',   slug: 'ram-memory' },
+  { categoryName: 'RAM', storeName: 'mdcomputers', slug: 'ram-memory' },
+  { categoryName: 'RAM', storeName: 'vedant',      slug: 'ram-memory' },
+  { categoryName: 'RAM', storeName: 'vishal',      slug: 'ram-memory' },
+  { categoryName: 'RAM', storeName: 'pcstudio',    slug: 'ram-memory' },
+
+  // ── Graphics Card ────────────────────────────────────────────
+  // DB: "Graphics Card" | Scraped from all 5 stores
+  { categoryName: 'Graphics Card', storeName: 'primeabgb',   slug: 'graphic-cards'  },
+  { categoryName: 'Graphics Card', storeName: 'mdcomputers', slug: 'graphic-cards'  },
+  { categoryName: 'Graphics Card', storeName: 'vedant',      slug: 'graphic-cards'  },
+  { categoryName: 'Graphics Card', storeName: 'vishal',      slug: 'graphic-cards'  },
+  { categoryName: 'Graphics Card', storeName: 'pcstudio',    slug: 'graphics-card'  }, // ← pcstudio slug is different: "graphics-card" not "graphic-cards"
+
+  // ── Motherboard ──────────────────────────────────────────────
+  // DB: "Motherboard" | Scraped from all 5 stores
+  { categoryName: 'Motherboard', storeName: 'primeabgb',   slug: 'motherboards' },
+  { categoryName: 'Motherboard', storeName: 'mdcomputers', slug: 'motherboards' },
+  { categoryName: 'Motherboard', storeName: 'vedant',      slug: 'motherboards' },
+  { categoryName: 'Motherboard', storeName: 'vishal',      slug: 'motherboards' },
+  { categoryName: 'Motherboard', storeName: 'pcstudio',    slug: 'motherboard'  }, // ← pcstudio slug is "motherboard" not "motherboards"
+
+  // ── Monitor ──────────────────────────────────────────────────
+  // DB: "Monitor" | Scraped from 4 stores (vedant has no monitor category)
+  { categoryName: 'Monitor', storeName: 'primeabgb',   slug: 'monitors' },
+  { categoryName: 'Monitor', storeName: 'mdcomputers', slug: 'monitors' },
+  { categoryName: 'Monitor', storeName: 'vishal',      slug: 'monitors' },
+  { categoryName: 'Monitor', storeName: 'pcstudio',    slug: 'monitors' },
+
+  // ── SSD ──────────────────────────────────────────────────────
+  // DB: "SSD" | mdcomputers has 5 SSD sub-categories — scrape all for best coverage
+  { categoryName: 'SSD', storeName: 'primeabgb',   slug: 'ssd'       },
+  { categoryName: 'SSD', storeName: 'mdcomputers', slug: 'ssd-sata'  },
+  { categoryName: 'SSD', storeName: 'mdcomputers', slug: 'ssd-gen3'  },
+  { categoryName: 'SSD', storeName: 'mdcomputers', slug: 'ssd-gen4'  },
+  { categoryName: 'SSD', storeName: 'mdcomputers', slug: 'ssd-gen5'  },
+  { categoryName: 'SSD', storeName: 'vedant',      slug: 'ssd'       },
+  { categoryName: 'SSD', storeName: 'vishal',      slug: 'ssd'       },
+  { categoryName: 'SSD', storeName: 'pcstudio',    slug: 'storage'   }, // pcstudio has combined storage
+
+  // ── External SSD ─────────────────────────────────────────────
+  // DB: "External SSD" | only mdcomputers has a dedicated slug
+  { categoryName: 'External SSD', storeName: 'mdcomputers', slug: 'external-ssd' },
+
+  // ── HDD ──────────────────────────────────────────────────────
+  // DB: "HDD" | internal HDD
+  { categoryName: 'HDD', storeName: 'primeabgb',   slug: 'hdd'          },
+  { categoryName: 'HDD', storeName: 'mdcomputers', slug: 'internal-hdd' },
+  { categoryName: 'HDD', storeName: 'vedant',      slug: 'hdd'          },
+  { categoryName: 'HDD', storeName: 'vishal',      slug: 'hdd'          },
+
+  // ── External Hard Drive ──────────────────────────────────────
+  // DB: "External Hard Drive" | mdcomputers only
+  { categoryName: 'External Hard Drive', storeName: 'mdcomputers', slug: 'external-hdd' },
+
+  // ── Cabinet ──────────────────────────────────────────────────
+  // DB: "Cabinet" | Scraped from all 5 stores
+  { categoryName: 'Cabinet', storeName: 'primeabgb',   slug: 'pc-case-cabinets' },
+  { categoryName: 'Cabinet', storeName: 'mdcomputers', slug: 'cabinet'          },
+  { categoryName: 'Cabinet', storeName: 'vedant',      slug: 'cabinet'          },
+  { categoryName: 'Cabinet', storeName: 'vishal',      slug: 'cabinet'          },
+  { categoryName: 'Cabinet', storeName: 'pcstudio',    slug: 'cabinets'         }, // ← pcstudio slug is "cabinets"
+
+  // ── Power Supply ─────────────────────────────────────────────
+  // DB: "Power Supply" | Scraped from 4 stores
+  { categoryName: 'Power Supply', storeName: 'primeabgb',   slug: 'smps'          },
+  { categoryName: 'Power Supply', storeName: 'vedant',      slug: 'power-supply'  },
+  { categoryName: 'Power Supply', storeName: 'vishal',      slug: 'power-supply'  },
+  { categoryName: 'Power Supply', storeName: 'pcstudio',    slug: 'power-supply'  },
+
+  // ── CPU Cooler ───────────────────────────────────────────────
+  // DB: "CPU Cooler" | Scraped from 4 stores
+  // Note: "CPU Air Cooler" and "CPU Liquid Cooler" are also in DB but
+  // no dedicated slugs exist for those — they'll come under CPU Cooler scrapes
+  { categoryName: 'CPU Cooler', storeName: 'primeabgb',   slug: 'cpu-cooler' },
+  { categoryName: 'CPU Cooler', storeName: 'vedant',      slug: 'cpu-cooler' },
+  { categoryName: 'CPU Cooler', storeName: 'pcstudio',    slug: 'cpu-cooler' },
+
+  // ── NAS ──────────────────────────────────────────────────────
+  // DB: "NAS" | primeabgb only
+  { categoryName: 'NAS', storeName: 'primeabgb', slug: 'nas' },
+
+  // ── Rackmount NAS ─────────────────────────────────────────────
+  // DB: "Rackmount NAS" | primeabgb only (same NAS page covers both)
+  { categoryName: 'Rackmount NAS', storeName: 'primeabgb', slug: 'nas' },
+
+  // ── Headset ──────────────────────────────────────────────────
+  // DB: "Headset" | primeabgb only
+  { categoryName: 'Headset', storeName: 'primeabgb', slug: 'gaming-headset' },
+
+  // ── Thermal Paste ────────────────────────────────────────────
+  // DB: "Thermal Paste" | vedant only
+  { categoryName: 'Thermal Paste', storeName: 'vedant', slug: 'thermal-paste' },
+
+  // ── Case Fan ─────────────────────────────────────────────────
+  // DB: "Case Fan" | vedant only
+  { categoryName: 'Case Fan', storeName: 'vedant', slug: 'case-fan' },
+
+  // ── Laptop Cooler ────────────────────────────────────────────
+  // DB: "Laptop Cooler" | vedant only
+  { categoryName: 'Laptop Cooler', storeName: 'vedant', slug: 'laptop-cooler' },
+
+  // ── Pendrive ─────────────────────────────────────────────────
+  // DB: "Pendrive" | mdcomputers only
+  { categoryName: 'Pendrive', storeName: 'mdcomputers', slug: 'pen-drives' },
+
+];
+
+// Build a fast lookup map: categoryName → config entry
+const SCRAPER_CONFIG_MAP = new Map(
+  SCRAPER_CONFIG.map(c => [c.categoryName, c])
+);
+
+// ─────────────────────────────────────────────────────────────
+
+const DEFAULT_FREQ_DAYS = 7;
 
 function isDue(nextScrapDueAt) {
   if (!nextScrapDueAt) return true;
@@ -73,18 +222,28 @@ async function getSqlPool() {
   });
 }
 
-// ── Load category schedule ────────────────────────────────────
-async function loadCategorySchedule(pool) {
-  const result = await pool.request().query(`
+// ── Load schedule only for categories we actually scrape ──────
+// Only queries for categories present in SCRAPER_CONFIG.
+// Ignores all 179 Shopify-only categories entirely.
+async function loadScrapingSchedule(pool) {
+  if (SCRAPER_CONFIG.length === 0) return [];
+
+  const request    = pool.request();
+  const paramNames = SCRAPER_CONFIG.map((c, i) => {
+    request.input(`cat${i}`, sql.NVarChar(200), c.categoryName);
+    return `@cat${i}`;
+  });
+
+  const result = await request.query(`
     SELECT
       ip.Category,
-      MAX(ip.NextScrapDueAt)                        AS NextScrapDueAt,
-      MAX(ip.LastScrapedAt)                         AS LastScrapedAt,
-      MAX(cs.ScrapFreqDays)                         AS ScrapFreqDays,
+      MAX(ip.NextScrapDueAt)                           AS NextScrapDueAt,
+      MAX(ip.LastScrapedAt)                            AS LastScrapedAt,
+      MAX(cs.ScrapFreqDays)                            AS ScrapFreqDays,
       CAST(MAX(CAST(cs.IsScrapEnabled AS INT)) AS BIT) AS IsScrapEnabled
     FROM InternalProducts ip
     LEFT JOIN CategorySettings cs ON cs.CategoryName = ip.Category
-    WHERE ip.Category IS NOT NULL
+    WHERE ip.Category IN (${paramNames.join(',')})
     GROUP BY ip.Category
     ORDER BY ip.Category
   `);
@@ -92,7 +251,7 @@ async function loadCategorySchedule(pool) {
   return result.recordset;
 }
 
-// ── Update timestamps after successful scrape ─────────────────
+// ── Update timestamps — only called when saved > 0 ────────────
 async function updateScrapedTimestamps(pool, categoryName, frequencyDays) {
   const now     = new Date();
   const nextDue = new Date(now);
@@ -110,55 +269,59 @@ async function updateScrapedTimestamps(pool, categoryName, frequencyDays) {
     `);
 }
 
-// ── Find matching store + category config from urls.js ────────
-function findStoreConfig(categoryName) {
-  for (const store of STORES) {
-    for (const cat of store.categories) {
-      const normalised = categoryName.toLowerCase().replace(/\s+/g, '-');
-      if (
-        cat.slug.toLowerCase() === normalised ||
-        cat.slug.toLowerCase().includes(normalised) ||
-        normalised.includes(cat.slug.toLowerCase())
-      ) {
-        return { store, category: cat };
-      }
-    }
-  }
-  return null;
+// ── Resolve store + category objects from urls.js ─────────────
+// Clean lookup — exact match only, no fuzzy logic.
+function resolveStoreConfig(storeName, slug) {
+  const store = STORES.find(s => s.name === storeName);
+  if (!store) return null;
+  const category = store.categories.find(c => c.slug === slug);
+  if (!category) return null;
+  return { store, category };
 }
 
-// ── Clear stale cache files before each scheduled scrape ──────
+// ── Clear stale cache files ───────────────────────────────────
 function clearCategoryCache(storeName, categorySlug) {
   const paths = getPaths(storeName, categorySlug);
-
   const filesToDelete = [
     paths.visitedCache,
     paths.urlsCache,
     paths.fullOutput,
     paths.priceOutput,
   ];
-
   for (const filePath of filesToDelete) {
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-    }
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
   }
 }
 
-// ── Push products for ONE category to Cosmos immediately ──────
-async function pushScrapedDataToCosmos(products, categoryLabel, log) {
+// ── Push scraped products to Cosmos ──────────────────────────
+async function pushScrapedDataToCosmos(products, label, log) {
   if (!products || products.length === 0) {
-    log(`⚠️  No products to push to Cosmos for ${categoryLabel}`);
+    log(`⚠️  No products to push for ${label}`);
     return { pushed: 0, failed: 0 };
   }
 
-  const client    = new CosmosClient(process.env.COSMOS_CONNECTION_STRING);
+  // FIX 3: Guard before touching CosmosClient
+  if (!process.env.COSMOS_CONNECTION_STRING) {
+    log(`❌ COSMOS_CONNECTION_STRING missing — skipping Cosmos push`);
+    log(`   Go to Azure Portal → App Service → Configuration → Application settings`);
+    return { pushed: 0, failed: products.length };
+  }
+
+  let client;
+  try {
+    client = new CosmosClient(process.env.COSMOS_CONNECTION_STRING);
+  } catch (err) {
+    log(`❌ CosmosClient init failed: ${err.message}`);
+    log(`   Check COSMOS_CONNECTION_STRING value in Azure App Settings`);
+    return { pushed: 0, failed: products.length };
+  }
+
   const container = client.database('ScraperDB').container('scrap_results');
 
   let pushed = 0;
   let failed = 0;
 
-  log(`☁️  Pushing ${products.length} products to Cosmos (${categoryLabel})...`);
+  log(`☁️  Pushing ${products.length} products to Cosmos (${label})...`);
 
   for (const product of products) {
     try {
@@ -171,34 +334,44 @@ async function pushScrapedDataToCosmos(products, categoryLabel, log) {
     }
   }
 
-  log(`✅ Cosmos push done — pushed: ${pushed} | failed: ${failed}`);
+  log(`✅ Cosmos: pushed ${pushed} | failed ${failed}`);
   return { pushed, failed };
 }
 
-// ── Read from Cosmos → map → push to SQL ─────────────────────
+// ── Cosmos → SQL cleanup mapper ───────────────────────────────
 async function runCleanupMapper(log) {
-  const client    = new CosmosClient(process.env.COSMOS_CONNECTION_STRING);
-  const container = client.database('ScraperDB').container('scrap_results');
+  if (!process.env.COSMOS_CONNECTION_STRING) {
+    log(`❌ COSMOS_CONNECTION_STRING missing — skipping cleanup mapper`);
+    return;
+  }
 
-  const { resources } = await container.items
-    .query('SELECT * FROM c')
-    .fetchAll();
+  let client;
+  try {
+    client = new CosmosClient(process.env.COSMOS_CONNECTION_STRING);
+  } catch (err) {
+    log(`❌ CosmosClient init failed: ${err.message}`);
+    log(`   Cleanup mapper skipped — CompetitorPrices not updated this run`);
+    return;
+  }
+
+  const container = client.database('ScraperDB').container('scrap_results');
+  const { resources } = await container.items.query('SELECT * FROM c').fetchAll();
 
   log(`📦 Cosmos → SQL: ${resources.length} documents`);
   const stats = await upsertManyFromCosmos(resources);
   log(`✅ Inserted: ${stats.inserted} | Updated: ${stats.updated} | Failed: ${stats.failed}`);
 }
 
-// ── Main scheduler ────────────────────────────────────────────
-// NEW: accepts optional options = { log, isCancelled }
-//   log(msg)        — custom logger (defaults to console.log)
-//   isCancelled()   — checked between categories (defaults to () => false)
+// ─────────────────────────────────────────────────────────────
+// MAIN SCHEDULER
+// ─────────────────────────────────────────────────────────────
 async function runScheduler(options = {}) {
   const log         = options.log         || ((msg) => console.log(msg));
   const isCancelled = options.isCancelled || (() => false);
 
   const startTime = Date.now();
   log('⏰ Scheduler starting...');
+  log(`📋 Scraper config has ${SCRAPER_CONFIG.length} categories configured`);
 
   let pool;
 
@@ -206,119 +379,135 @@ async function runScheduler(options = {}) {
     pool = await getSqlPool();
     log('🔌 Connected to SQL');
 
-    const categories = await loadCategorySchedule(pool);
-    log(`📋 Found ${categories.length} distinct categories`);
+    // Load schedule only for categories in SCRAPER_CONFIG
+    const scheduleRows = await loadScrapingSchedule(pool);
 
+    // Build map: categoryName → schedule row
+    const scheduleMap = new Map(scheduleRows.map(r => [r.Category, r]));
+
+    // Determine due / skipped / paused
     const due     = [];
     const skipped = [];
     const paused  = [];
 
-    for (const row of categories) {
-      if (row.IsScrapEnabled === false || row.IsScrapEnabled === 0) {
-        paused.push(row);
+    for (const config of SCRAPER_CONFIG) {
+      const schedule   = scheduleMap.get(config.categoryName);
+      const isEnabled  = schedule ? (schedule.IsScrapEnabled !== false && schedule.IsScrapEnabled !== 0) : true;
+      const freqDays   = schedule?.ScrapFreqDays ?? DEFAULT_FREQ_DAYS;
+      const nextDue    = schedule?.NextScrapDueAt ?? null;
+
+      if (!isEnabled) {
+        paused.push({ ...config, freqDays });
         continue;
       }
 
-      const freqDays = row.ScrapFreqDays ?? getDefaultFrequency(row.Category);
-
-      if (isDue(row.NextScrapDueAt)) {
-        due.push({ ...row, freqDays });
+      if (isDue(nextDue)) {
+        due.push({ ...config, freqDays, nextDue });
       } else {
-        skipped.push({ ...row, freqDays });
+        skipped.push({ ...config, freqDays, nextDue });
       }
     }
 
-    log(`✅ Due for scraping   : ${due.length} categories`);
-    log(`⏭️  Not due yet        : ${skipped.length} categories`);
+    log(`✅ Due for scraping  : ${due.length} categories`);
+    log(`⏭️  Not due yet       : ${skipped.length} categories`);
 
     if (paused.length > 0) {
-      log(`⏸️  Paused (UI)        : ${paused.length} categories`);
-      paused.forEach(r => log(`   → ${r.Category} (paused)`));
+      log(`⏸️  Paused (Settings) : ${paused.length} categories`);
+      paused.forEach(r => log(`   → ${r.categoryName}`));
     }
 
-    if (skipped.length > 0) {
-      skipped.forEach(r =>
-        log(`⏭️  Skipping ${r.Category} — next due: ${r.NextScrapDueAt || 'unknown'}`)
-      );
-    }
+    skipped.forEach(r =>
+      log(`⏭️  Skipping ${r.categoryName} — next due: ${r.nextDue}`)
+    );
 
     if (due.length === 0) {
       log('ℹ️  Nothing to scrape — all categories are up to date.');
-      log('💡 Tip: categories become due again after their scrape frequency window passes.');
       return;
     }
 
-    log(`🚀 Starting scrapes for ${due.length} due categories...`);
+    log(`\n🚀 Starting scrapes for ${due.length} categories...`);
 
-    let totalScraped    = 0;
-    let totalFailed     = 0;
-    let totalPushed     = 0;
-    let categoriesDone  = 0;
+    let totalScraped   = 0;
+    let totalFailed    = 0;
+    let totalPushed    = 0;
+    let categoriesDone = 0;
 
-    for (const row of due) {
-      // ── Check cancel flag between categories ──────────────
-      // NEVER cancels mid-category — always finishes current one first.
+    for (const entry of due) {
+      // Check cancel between categories — never mid-category
       if (isCancelled()) {
         log(`🛑 Cancellation requested — stopping after ${categoriesDone} categories.`);
-        log(`   Remaining categories will be scraped on next run.`);
+        log(`   Remaining categories will be retried on next run.`);
         break;
       }
 
-      log(`━━━ Category: ${row.Category} (every ${row.freqDays} days) ━━━`);
+      // Resolve store + category objects from urls.js
+      const resolved = resolveStoreConfig(entry.storeName, entry.slug);
 
-      const config = findStoreConfig(row.Category);
-
-      if (!config) {
-        log(`⚠️  No store config found for "${row.Category}" in urls.js — skipping`);
-        log(`   This is expected for categories not yet added to urls.js`);
+      if (!resolved) {
+        log(`⚠️  Config error: storeName="${entry.storeName}" slug="${entry.slug}" not found in urls.js`);
+        log(`   Check SCRAPER_CONFIG entry for "${entry.categoryName}"`);
         continue;
       }
 
-      log(`   Store: ${config.store.name} | Slug: ${config.category.slug}`);
+      const { store, category } = resolved;
+
+      log(`━━━ ${entry.categoryName} → ${store.name}/${category.slug} (every ${entry.freqDays}d) ━━━`);
+
       log(`   🗑️  Clearing stale cache...`);
-      clearCategoryCache(config.store.name, config.category.slug);
+      clearCategoryCache(store.name, category.slug);
 
       try {
-        log(`   🌐 Scraping ${config.store.name}/${config.category.slug}...`);
-        const result = await scrapeCategory(config.store, config.category);
-        totalScraped += result.saved;
-        totalFailed  += result.failed;
+        log(`   🌐 Scraping ${store.name}/${category.slug}...`);
+        const result = await scrapeCategory(store, category);
+
         log(`   📦 Scraped: ${result.saved} products | Failed: ${result.failed}`);
 
-        if (result.products && result.products.length > 0) {
+        if (result.saved === 0) {
+          // FIX 2: Do NOT update NextScrapDueAt on zero results.
+          // Category stays due so it retries next run.
+          log(`   ⚠️  0 products scraped — NextScrapDueAt NOT updated (will retry next run)`);
+          totalFailed++;
+          continue;
+        }
+
+        totalScraped += result.saved;
+
+        // Push to Cosmos immediately after each category (crash-safe)
+        if (result.products?.length > 0) {
           const { pushed } = await pushScrapedDataToCosmos(
             result.products,
-            `${config.store.name}/${config.category.slug}`,
+            `${store.name}/${category.slug}`,
             log
           );
           totalPushed += pushed;
-        } else {
-          log(`   ⚠️  No products returned for ${row.Category} — skipping Cosmos push`);
         }
 
-        await updateScrapedTimestamps(pool, row.Category, row.freqDays);
-        log(`   ⏰ Next scrape scheduled in ${row.freqDays} days`);
+        // FIX 2: Only stamp timestamps when we actually got products
+        await updateScrapedTimestamps(pool, entry.categoryName, entry.freqDays);
+        log(`   ⏰ Next scrape in ${entry.freqDays} days`);
         categoriesDone++;
 
       } catch (err) {
-        log(`   ❌ Scrape failed for ${row.Category}: ${err.message}`);
+        log(`   ❌ Scrape failed for ${entry.categoryName}: ${err.message}`);
         totalFailed++;
+        // No timestamp update on exception — category retries next run
       }
     }
 
+    // Run cleanup mapper once at the end
     if (categoriesDone > 0) {
-      log('📤 Running cleanup mapper (Cosmos → SQL CompetitorPrices)...');
+      log('\n📤 Running cleanup mapper (Cosmos → SQL CompetitorPrices)...');
       await runCleanupMapper(log);
     } else {
-      log('⚠️  No categories completed — skipping cleanup mapper');
+      log('\n⚠️  No categories completed — skipping cleanup mapper');
     }
 
     const totalSec = ((Date.now() - startTime) / 1000).toFixed(1);
-    log(`🎉 Scheduler finished in ${totalSec}s`);
+    log(`\n🎉 Scheduler finished in ${totalSec}s`);
     log(`   Categories done  : ${categoriesDone}`);
     log(`   Products scraped : ${totalScraped}`);
     log(`   Cosmos pushed    : ${totalPushed}`);
-    log(`   Failed           : ${totalFailed}`);
+    log(`   Failed/skipped   : ${totalFailed}`);
 
   } catch (err) {
     log(`❌ Scheduler fatal error: ${err.message}`);
@@ -336,375 +525,3 @@ if (require.main === module) {
 }
 
 module.exports = { runScheduler };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// // src/scheduler/index.js
-// //
-// // CHANGE (safety improvement):
-// //   pushScrapedDataToCosmos() is now called PER CATEGORY immediately
-// //   after scrapeCategory() completes — instead of batching everything
-// //   at the end. This means a mid-run crash only loses the current
-// //   category's data, not all categories scraped so far.
-// //
-// //   runCleanupMapper() is still called ONCE at the end (after all
-// //   categories) because it reads ALL of Cosmos and does a single bulk
-// //   MERGE into SQL. Running it per-category would cause redundant work.
-// //
-// // FULL AUTOMATED FLOW:
-// //   Scheduler fires
-// //     → Load category schedule from SQL
-// //     → For each due category:
-// //         a. clearCategoryCache()        wipe stale disk files
-// //         b. scrapeCategory()            scrape → return products[] in memory
-// //         c. pushScrapedDataToCosmos()   push THIS category immediately ← CHANGED
-// //         d. updateScrapedTimestamps()   update NextScrapDueAt in SQL
-// //     → runCleanupMapper()              Cosmos → map → upsert CompetitorPrices SQL (once, at end)
-// // ─────────────────────────────────────────────────────────────
-
-// require('dotenv').config();
-
-// const fs   = require('fs');
-// const sql  = require('mssql');
-// const { AzureCliCredential, ManagedIdentityCredential } = require('@azure/identity');
-// const { CosmosClient }         = require('@azure/cosmos');
-
-// const { STORES }               = require('../urls');
-// const { scrapeCategory }       = require('../scraper/index');
-// const { upsertManyFromCosmos } = require('../services/competitorPriceService');
-// const { getPaths }             = require('../scraper/fileHelpers');
-
-// // ── System-wide default frequencies (days) ───────────────────
-// const DEFAULT_FREQUENCIES = {
-//   'Processor' : 7,
-//   'RAM'       : 7,
-//   'SSD'       : 7,
-//   'HDD'       : 7,
-//   'Storage'   : 7,
-//   'DEFAULT'   : 7,
-// };
-
-// function getDefaultFrequency(categoryName) {
-//   const key = Object.keys(DEFAULT_FREQUENCIES).find(
-//     k => k.toLowerCase() === (categoryName || '').toLowerCase()
-//   );
-//   return DEFAULT_FREQUENCIES[key] || DEFAULT_FREQUENCIES['DEFAULT'];
-// }
-
-// function isDue(nextScrapDueAt) {
-//   if (!nextScrapDueAt) return true;
-//   return new Date() >= new Date(nextScrapDueAt);
-// }
-
-// // ── SQL connection ────────────────────────────────────────────
-// async function getSqlPool() {
-//   const credential = process.env.AZURE_ENV === 'production'
-//     ? new ManagedIdentityCredential({ clientId: process.env.db_userclientid })
-//     : new AzureCliCredential();
-
-//   const tokenResponse = await credential.getToken(
-//     'https://database.windows.net/.default'
-//   );
-
-//   return await sql.connect({
-//     server  : process.env.db_serverendpoint,
-//     database: 'db_tpstechautomata',
-//     authentication: {
-//       type   : 'azure-active-directory-access-token',
-//       options: { token: tokenResponse.token },
-//     },
-//     options: {
-//       encrypt              : true,
-//       trustServerCertificate: false,
-//       requestTimeout       : 60_000,
-//     },
-//   });
-// }
-
-// // ── Load category schedule ────────────────────────────────────
-// async function loadCategorySchedule(pool) {
-//   const result = await pool.request().query(`
-//     SELECT
-//       ip.Category,
-//       MAX(ip.NextScrapDueAt)     AS NextScrapDueAt,
-//       MAX(ip.LastScrapedAt)      AS LastScrapedAt,
-//       MAX(cs.ScrapFreqDays)      AS ScrapFreqDays,
-//       MAX(cs.IsScrapEnabled)     AS IsScrapEnabled
-//     FROM InternalProducts ip
-//     LEFT JOIN CategorySettings cs ON cs.CategoryName = ip.Category
-//     WHERE ip.Category IS NOT NULL
-//     GROUP BY ip.Category
-//     ORDER BY ip.Category
-//   `);
-
-//   return result.recordset;
-// }
-
-// // ── Update timestamps after successful scrape ─────────────────
-// async function updateScrapedTimestamps(pool, categoryName, frequencyDays) {
-//   const now     = new Date();
-//   const nextDue = new Date(now);
-//   nextDue.setDate(nextDue.getDate() + frequencyDays);
-
-//   await pool.request()
-//     .input('Category',       sql.NVarChar(200), categoryName)
-//     .input('LastScrapedAt',  sql.NVarChar(50),  now.toISOString())
-//     .input('NextScrapDueAt', sql.NVarChar(50),  nextDue.toISOString())
-//     .query(`
-//       UPDATE InternalProducts
-//       SET LastScrapedAt  = @LastScrapedAt,
-//           NextScrapDueAt = @NextScrapDueAt
-//       WHERE Category = @Category
-//     `);
-
-//   console.log(`   ⏰ NextScrapDueAt set to ${nextDue.toISOString()} (+${frequencyDays} days)`);
-// }
-
-// // ── Find matching store + category config from urls.js ────────
-// function findStoreConfig(categoryName) {
-//   for (const store of STORES) {
-//     for (const cat of store.categories) {
-//       const normalised = categoryName.toLowerCase().replace(/\s+/g, '-');
-//       if (
-//         cat.slug.toLowerCase() === normalised ||
-//         cat.slug.toLowerCase().includes(normalised) ||
-//         normalised.includes(cat.slug.toLowerCase())
-//       ) {
-//         return { store, category: cat };
-//       }
-//     }
-//   }
-//   return null;
-// }
-
-// // ── Clear stale cache files before each scheduled scrape ──────
-// function clearCategoryCache(storeName, categorySlug) {
-//   const paths = getPaths(storeName, categorySlug);
-
-//   const filesToDelete = [
-//     paths.visitedCache,
-//     paths.urlsCache,
-//     paths.fullOutput,
-//     paths.priceOutput,
-//   ];
-
-//   for (const filePath of filesToDelete) {
-//     if (fs.existsSync(filePath)) {
-//       fs.unlinkSync(filePath);
-//       console.log(`   🗑️  Cleared: ${filePath}`);
-//     }
-//   }
-// }
-
-// // ── Push products for ONE category to Cosmos immediately ──────
-// // CHANGE: was previously called once at the end with ALL products.
-// // Now called per-category right after scrapeCategory() returns.
-// // This means a crash mid-run only loses the current category,
-// // not everything scraped before it.
-// //
-// // Cosmos upsert is idempotent (same URL = same id), so re-running
-// // is always safe — no duplicates, no data corruption.
-// async function pushScrapedDataToCosmos(products, categoryLabel) {
-//   if (!products || products.length === 0) {
-//     console.log(`   ⚠️  No products to push to Cosmos for ${categoryLabel}`);
-//     return { pushed: 0, failed: 0 };
-//   }
-
-//   const client    = new CosmosClient(process.env.COSMOS_CONNECTION_STRING);
-//   const container = client.database('ScraperDB').container('scrap_results');
-
-//   let pushed = 0;
-//   let failed = 0;
-
-//   console.log(`   ☁️  Pushing ${products.length} products to Cosmos (${categoryLabel})...`);
-
-//   for (const product of products) {
-//     try {
-//       product.id = Buffer.from(product.url).toString('base64').substring(0, 255);
-//       await container.items.upsert(product);
-//       pushed++;
-//     } catch (err) {
-//       console.error(`   ❌ Cosmos upsert failed: ${product.url} — ${err.message}`);
-//       failed++;
-//     }
-//   }
-
-//   console.log(`   ✅ Cosmos push done — pushed: ${pushed} | failed: ${failed}`);
-//   return { pushed, failed };
-// }
-
-// // ── Read from Cosmos → map → push to SQL (unchanged) ─────────
-// // Still runs once at the END after all categories are done.
-// // This is intentional: running it per-category would cause multiple
-// // full-table scans of Cosmos and redundant SQL MERGE operations.
-// async function runCleanupMapper() {
-//   const client    = new CosmosClient(process.env.COSMOS_CONNECTION_STRING);
-//   const container = client.database('ScraperDB').container('scrap_results');
-
-//   const { resources } = await container.items
-//     .query('SELECT * FROM c')
-//     .fetchAll();
-
-//   console.log(`\n📦 Cosmos → SQL: ${resources.length} documents`);
-//   const stats = await upsertManyFromCosmos(resources);
-//   console.log(`   Inserted: ${stats.inserted} | Updated: ${stats.updated} | Failed: ${stats.failed}`);
-// }
-
-// // ── Main scheduler ────────────────────────────────────────────
-// async function runScheduler() {
-//   const startTime = Date.now();
-//   console.log('⏰ Scheduler starting...\n');
-
-//   let pool;
-
-//   try {
-//     pool = await getSqlPool();
-//     console.log('🔌 Connected to SQL\n');
-
-//     const categories = await loadCategorySchedule(pool);
-//     console.log(`📋 Found ${categories.length} distinct categories\n`);
-
-//     const due     = [];
-//     const skipped = [];
-//     const paused  = [];
-
-//     for (const row of categories) {
-//       if (row.IsScrapEnabled === false || row.IsScrapEnabled === 0) {
-//         paused.push(row);
-//         continue;
-//       }
-
-//       const freqDays = row.ScrapFreqDays ?? getDefaultFrequency(row.Category);
-
-//       if (isDue(row.NextScrapDueAt)) {
-//         due.push({ ...row, freqDays });
-//       } else {
-//         skipped.push({ ...row, freqDays });
-//       }
-//     }
-
-//     console.log(`✅ Due for scraping   : ${due.length} categories`);
-//     console.log(`⏭️  Not due yet        : ${skipped.length} categories`);
-//     if (paused.length > 0) {
-//       console.log(`⏸️  Paused (UI)        : ${paused.length} categories`);
-//       paused.forEach(r => console.log(`   → ${r.Category}`));
-//     }
-
-//     if (skipped.length > 0) {
-//       console.log('\n   Skipped (next due):');
-//       skipped.forEach(r =>
-//         console.log(`   → ${r.Category.padEnd(25)} next: ${r.NextScrapDueAt || 'unknown'}`)
-//       );
-//     }
-
-//     if (due.length === 0) {
-//       console.log('\n🎉 Nothing to scrape today. All categories are up to date.');
-//       return;
-//     }
-
-//     console.log('\n🚀 Starting scrapes...');
-
-//     let totalScraped    = 0;
-//     let totalFailed     = 0;
-//     let totalPushed     = 0;  // track total Cosmos pushes across all categories
-//     let categoriesDone  = 0;
-
-//     for (const row of due) {
-//       console.log(`\n━━━ ${row.Category} (every ${row.freqDays} days) ━━━`);
-
-//       const config = findStoreConfig(row.Category);
-
-//       if (!config) {
-//         console.log(`   ⚠️  No store config found for "${row.Category}" in urls.js — skipping`);
-//         continue;
-//       }
-
-//       console.log(`   Store: ${config.store.name} | Slug: ${config.category.slug}`);
-
-//       // Clear stale cache so scraper starts completely fresh
-//       console.log(`   🗑️  Clearing stale cache...`);
-//       clearCategoryCache(config.store.name, config.category.slug);
-
-//       try {
-//         // 1. Scrape — returns products[] in memory
-//         const result = await scrapeCategory(config.store, config.category);
-//         totalScraped += result.saved;
-//         totalFailed  += result.failed;
-
-//         // 2. Push THIS category to Cosmos immediately
-//         //    CHANGE: was at the end, now per-category for crash safety
-//         if (result.products && result.products.length > 0) {
-//           const { pushed } = await pushScrapedDataToCosmos(
-//             result.products,
-//             `${config.store.name}/${config.category.slug}`
-//           );
-//           totalPushed += pushed;
-//         } else {
-//           console.log(`   ⚠️  No products returned for ${row.Category} — skipping Cosmos push`);
-//         }
-
-//         // 3. Update SQL timestamps so this category is marked done
-//         await updateScrapedTimestamps(pool, row.Category, row.freqDays);
-//         categoriesDone++;
-
-//       } catch (err) {
-//         console.error(`   ❌ Scrape failed for ${row.Category}: ${err.message}`);
-//         totalFailed++;
-//         // Continue to next category — don't abort the whole run
-//       }
-//     }
-
-//     // Map Cosmos documents → upsert into CompetitorPrices SQL table
-//     // Runs once at the end so all freshly pushed data is included
-//     if (categoriesDone > 0) {
-//       console.log('\n📤 Running cleanup mapper (Cosmos → SQL)...');
-//       await runCleanupMapper();
-//     } else {
-//       console.log('\n⚠️  No categories completed — skipping cleanup mapper');
-//     }
-
-//     const totalSec = ((Date.now() - startTime) / 1000).toFixed(1);
-//     console.log(`\n🎉 Scheduler done in ${totalSec}s`);
-//     console.log(`   Categories done  : ${categoriesDone}`);
-//     console.log(`   Products scraped : ${totalScraped}`);
-//     console.log(`   Cosmos pushed    : ${totalPushed}`);
-//     console.log(`   Failed           : ${totalFailed}`);
-
-//   } catch (err) {
-//     console.error('\n❌ Scheduler fatal error:', err.message);
-//     process.exit(1);
-//   } finally {
-//     if (pool) await pool.close();
-//   }
-// }
-
-// if (require.main === module) {
-//   runScheduler();
-// }
-
-// module.exports = { runScheduler };
