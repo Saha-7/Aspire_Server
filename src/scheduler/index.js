@@ -517,6 +517,156 @@ async function runScheduler(options = {}) {
   }
 }
 
+
+
+function getManualScraperCategories() {
+  const grouped = new Map();
+
+  for (const entry of SCRAPER_CONFIG) {
+    if (!grouped.has(entry.categoryName)) {
+      grouped.set(entry.categoryName, {
+        categoryName: entry.categoryName,
+        stores: [],
+      });
+    }
+
+    grouped.get(entry.categoryName).stores.push({
+      storeName: entry.storeName,
+      slug: entry.slug,
+    });
+  }
+
+  return [...grouped.values()]
+    .map(category => ({
+      ...category,
+      storeCount: new Set(category.stores.map(store => store.storeName)).size,
+      jobCount: category.stores.length,
+    }))
+    .sort((a, b) => a.categoryName.localeCompare(b.categoryName));
+}
+
+async function updateManualScrapedAt(pool, categoryName) {
+  await pool.request()
+    .input('Category', sql.NVarChar(200), categoryName)
+    .input('LastScrapedAt', sql.NVarChar(50), new Date().toISOString())
+    .query(`
+      UPDATE InternalProducts
+      SET LastScrapedAt = @LastScrapedAt
+      WHERE Category = @Category
+    `);
+}
+
+async function runManualScraper(options = {}) {
+  const log = options.log || console.log;
+  const isCancelled = options.isCancelled || (() => false);
+
+  const selectedCategories = [...new Set(
+    (options.categoryNames || [])
+      .map(category => String(category).trim())
+      .filter(Boolean)
+  )];
+
+  if (selectedCategories.length === 0) {
+    throw new Error('Select at least one category to scrape.');
+  }
+
+  const knownCategories = new Set(SCRAPER_CONFIG.map(entry => entry.categoryName));
+  const unknownCategories = selectedCategories.filter(category => !knownCategories.has(category));
+
+  if (unknownCategories.length > 0) {
+    throw new Error(`Unknown scraper categories: ${unknownCategories.join(', ')}`);
+  }
+
+  const selectedSet = new Set(selectedCategories);
+  const scrapeEntries = SCRAPER_CONFIG.filter(entry => selectedSet.has(entry.categoryName));
+
+  let pool;
+  let jobsDone = 0;
+  let totalScraped = 0;
+  let totalPushed = 0;
+  let totalFailed = 0;
+
+  log('Manual scraper starting...');
+  log(`Selected categories: ${selectedCategories.length}`);
+  log(`Store/category jobs: ${scrapeEntries.length}`);
+
+  try {
+    pool = await getSqlPool();
+    log('Connected to SQL');
+
+    for (const entry of scrapeEntries) {
+      if (isCancelled()) {
+        log(`Cancellation requested - stopping after ${jobsDone} jobs.`);
+        break;
+      }
+
+      const resolved = resolveStoreConfig(entry.storeName, entry.slug);
+
+      if (!resolved) {
+        log(`Config error: ${entry.storeName}/${entry.slug} not found in urls.js`);
+        totalFailed++;
+        continue;
+      }
+
+      const { store, category } = resolved;
+
+      log(`Starting ${entry.categoryName} -> ${store.name}/${category.slug}`);
+
+      clearCategoryCache(store.name, category.slug);
+
+      try {
+        const result = await scrapeCategory(store, category);
+
+        log(`Scraped: ${result.saved} products | Failed: ${result.failed}`);
+
+        if (result.saved === 0) {
+          log('0 products scraped - scheduler dates not updated.');
+          totalFailed++;
+          continue;
+        }
+
+        totalScraped += result.saved;
+
+        if (result.products?.length > 0) {
+          const { pushed } = await pushScrapedDataToCosmos(
+            result.products,
+            `${store.name}/${category.slug}`,
+            log
+          );
+
+          totalPushed += pushed;
+        }
+
+        // Important:
+        // Manual scraping does NOT update LastScrapedAt or NextScrapDueAt.
+        jobsDone++;
+      } catch (err) {
+        log(`Failed ${entry.categoryName} -> ${store.name}/${category.slug}: ${err.message}`);
+        totalFailed++;
+      }
+    }
+
+    if (jobsDone > 0) {
+      log('Running cleanup mapper...');
+      await runCleanupMapper(log);
+    } else {
+      log('No jobs completed - skipping cleanup mapper.');
+    }
+
+    log('Manual scraper finished.');
+    log(`Jobs done: ${jobsDone}`);
+    log(`Products scraped: ${totalScraped}`);
+    log(`Cosmos pushed: ${totalPushed}`);
+    log(`Failed/skipped: ${totalFailed}`);
+  } finally {
+    if (pool) await pool.close();
+  }
+}
+
+
+
+
+
 if (require.main === module) {
   runScheduler().catch(err => {
     console.error('Fatal error:', err.message);
@@ -524,4 +674,10 @@ if (require.main === module) {
   });
 }
 
-module.exports = { runScheduler };
+
+
+module.exports = {
+  runScheduler,
+  runManualScraper,
+  getManualScraperCategories,
+};
