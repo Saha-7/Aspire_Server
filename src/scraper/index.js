@@ -1,7 +1,7 @@
 // src/scraper/index.js
 //
 // CHANGE:
-//   scrapeCategory() now returns { done, saved, failed, products[] }
+//   scrapeCategory() now returns { done, saved, failed, products[], cancelled }
 //   The products array contains all successfully scraped product objects
 //   in memory so the scheduler can push them directly to Cosmos without
 //   reading back from disk. Disk writes (output/ folder) still happen
@@ -9,26 +9,14 @@
 //
 //   Manual runs (node src/scraper/index.js) are completely unchanged.
 //
-// FIX (2026-06-13):
-//   collectUrlsForCategory() had two cache bugs that caused 0-product runs
-//   in production on Azure:
+// FIX 1 (2026-06-13): Cache bugs — see details below.
 //
-//   Bug 1 — Empty array treated as valid cache:
-//     `if (saved)` is truthy for [] in JS. If a previous run fetched a
-//     page and got 0 links (e.g. Bright Data returned a challenge page),
-//     it wrote an empty collected_urls.json. Every subsequent run loaded
-//     that empty cache and immediately exited with 0 products. Fixed by
-//     changing to `if (saved && saved.length > 0)`.
-//
-//   Bug 2 — Empty cache file written after 0-link fetch:
-//     A failed/blocked fetch would write an empty collected_urls.json,
-//     permanently poisoning the cache for that category. Fixed by only
-//     writing the cache file when productUrls.size > 0.
-//
-//   Immediate remediation (no deploy needed): delete stale cache files
-//   from the Azure SSH console:
-//     find /home/site/wwwroot/output -name "collected_urls.json" -delete
-//     find /home/site/wwwroot/output -name "visited.json" -delete
+// FIX 2 (2026-06-13): Cancel now stops IMMEDIATELY between products,
+//   not just between categories. isCancelled() is now accepted as an
+//   optional parameter and checked inside the product scraping loop.
+//   When cancel is requested mid-category, the function returns early
+//   with whatever products were already scraped, and sets cancelled=true
+//   in the return value so the caller knows to stop.
 // ─────────────────────────────────────────────────────────────
 
 require('dotenv').config();
@@ -45,10 +33,9 @@ const { STORES }                                           = require('../urls');
 async function collectUrlsForCategory(store, startUrl, urlsCachePath) {
   const saved = readJson(urlsCachePath, null);
 
-  // FIX Bug 1: `if (saved)` was truthy for an empty array [].
-  // A previous run that got 0 links from a blocked/challenge page would
-  // write [], and every run after that would load it and return 0 URLs.
-  // Now we only use the cache if it actually contains URLs.
+  // FIX: `if (saved)` was truthy for an empty array [].
+  // A previous run that got 0 links would write [], and every run after
+  // that would load it and return 0 URLs. Only use cache if it has URLs.
   if (saved && saved.length > 0) {
     console.log(`  ♻️  Loaded ${saved.length} cached URLs`);
     return new Set(saved);
@@ -85,11 +72,9 @@ async function collectUrlsForCategory(store, startUrl, urlsCachePath) {
     await new Promise(r => setTimeout(r, 1500));
   }
 
-  // FIX Bug 2: never write an empty cache file.
-  // If Bright Data returned a challenge/empty page, writing [] here would
-  // poison the cache permanently (until manually deleted). Now we only
-  // write the file when we actually found URLs, so the next run will
-  // attempt a real fetch instead of loading an empty cache.
+  // FIX: Never write an empty cache file.
+  // If Bright Data returned a challenge/empty page, writing [] would
+  // poison the cache permanently. Only write when we actually found URLs.
   if (productUrls.size > 0) {
     writeJson(urlsCachePath, [...productUrls]);
     console.log(`  💾 Saved ${productUrls.size} URLs to cache`);
@@ -107,14 +92,16 @@ async function collectUrlsForCategory(store, startUrl, urlsCachePath) {
 /**
  * Scrapes all products for a single store + category.
  *
- * @returns {Promise<{ done, saved, failed, products[] }>}
+ * @param {object} store
+ * @param {object} category
+ * @param {function} [isCancelled] - Optional. Called before each product.
+ *   If it returns true, scraping stops immediately and the function
+ *   returns early with cancelled=true. Defaults to () => false.
  *
- * CHANGE: now also returns `products` — the array of all successfully
- * scraped product objects held in memory. The scheduler uses this to
- * push directly to Cosmos without reading back from disk, which is
- * required for Azure deployment where the local filesystem is ephemeral.
+ * @returns {Promise<{ done, saved, failed, products[], cancelled }>}
+ *   cancelled=true means scraping was cut short by the cancel flag.
  */
-async function scrapeCategory(store, category) {
+async function scrapeCategory(store, category, isCancelled = () => false) {
   const { name: storeName }    = store;
   const { slug, url: startUrl } = category;
 
@@ -128,12 +115,13 @@ async function scrapeCategory(store, category) {
   const productUrls = await collectUrlsForCategory(store, startUrl, paths.urlsCache);
   console.log(`  ✅ ${productUrls.size} product URLs total`);
 
-  const visited  = new Set(readJson(paths.visitedCache, []));
-  const total    = productUrls.size;
-  let done       = visited.size;
-  let saved      = 0;
-  let failed     = 0;
-  const products = []; // ← NEW: collect scraped products in memory
+  const visited   = new Set(readJson(paths.visitedCache, []));
+  const total     = productUrls.size;
+  let done        = visited.size;
+  let saved       = 0;
+  let failed      = 0;
+  let cancelled   = false;
+  const products  = [];
 
   if (visited.size > 0) {
     console.log(`  ♻️  Resuming: ${visited.size} already done, ${total - visited.size} remaining`);
@@ -141,6 +129,15 @@ async function scrapeCategory(store, category) {
 
   for (const productUrl of productUrls) {
     if (visited.has(productUrl)) continue;
+
+    // FIX 2: Check cancel flag before every single product, not just
+    // between categories. This gives near-immediate stop on cancel.
+    if (isCancelled()) {
+      console.log(`  🛑 Cancel requested — stopping after ${saved} products scraped in this category`);
+      cancelled = true;
+      break;
+    }
+
     done++;
 
     process.stdout.write(`  🛒 [${done}/${total}] `);
@@ -150,7 +147,7 @@ async function scrapeCategory(store, category) {
     if (product?.name) {
       console.log(`✅ ${product.name.substring(0, 55)}`);
       saved++;
-      products.push(product); // ← NEW: keep in memory
+      products.push(product);
     } else {
       console.log(`⚠️  No data — ${productUrl}`);
       failed++;
@@ -162,13 +159,12 @@ async function scrapeCategory(store, category) {
     await new Promise(r => setTimeout(r, 1500));
   }
 
-  console.log(`\n  🏁 ${storeName}/${slug} complete`);
+  console.log(`\n  🏁 ${storeName}/${slug} complete${cancelled ? ' (cancelled)' : ''}`);
   console.log(`     Saved : ${saved} | Failed: ${failed} | Total: ${done}`);
   console.log(`     Full  → ${paths.fullOutput}`);
   console.log(`     Price → ${paths.priceOutput}`);
 
-  // CHANGE: products[] added to return value
-  return { done, saved, failed, products };
+  return { done, saved, failed, products, cancelled };
 }
 
 // ─────────────────────────────────────────────────────────────
