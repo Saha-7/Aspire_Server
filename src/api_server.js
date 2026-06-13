@@ -44,8 +44,8 @@ app.use(session({
   resave           : false,
   saveUninitialized: false,
   cookie: {
-    secure  : process.env.AZURE_ENV === 'production',
-    sameSite: process.env.AZURE_ENV === 'production' ? 'none' : 'lax',
+    secure  : true,
+    sameSite: 'none',
     httpOnly: true,
     maxAge  : 24 * 60 * 60 * 1000, // 24 hours
   },
