@@ -8,6 +8,27 @@
 //   as a backup/log but are NOT relied upon for the automated flow.
 //
 //   Manual runs (node src/scraper/index.js) are completely unchanged.
+//
+// FIX (2026-06-13):
+//   collectUrlsForCategory() had two cache bugs that caused 0-product runs
+//   in production on Azure:
+//
+//   Bug 1 — Empty array treated as valid cache:
+//     `if (saved)` is truthy for [] in JS. If a previous run fetched a
+//     page and got 0 links (e.g. Bright Data returned a challenge page),
+//     it wrote an empty collected_urls.json. Every subsequent run loaded
+//     that empty cache and immediately exited with 0 products. Fixed by
+//     changing to `if (saved && saved.length > 0)`.
+//
+//   Bug 2 — Empty cache file written after 0-link fetch:
+//     A failed/blocked fetch would write an empty collected_urls.json,
+//     permanently poisoning the cache for that category. Fixed by only
+//     writing the cache file when productUrls.size > 0.
+//
+//   Immediate remediation (no deploy needed): delete stale cache files
+//   from the Azure SSH console:
+//     find /home/site/wwwroot/output -name "collected_urls.json" -delete
+//     find /home/site/wwwroot/output -name "visited.json" -delete
 // ─────────────────────────────────────────────────────────────
 
 require('dotenv').config();
@@ -23,7 +44,12 @@ const { STORES }                                           = require('../urls');
 
 async function collectUrlsForCategory(store, startUrl, urlsCachePath) {
   const saved = readJson(urlsCachePath, null);
-  if (saved) {
+
+  // FIX Bug 1: `if (saved)` was truthy for an empty array [].
+  // A previous run that got 0 links from a blocked/challenge page would
+  // write [], and every run after that would load it and return 0 URLs.
+  // Now we only use the cache if it actually contains URLs.
+  if (saved && saved.length > 0) {
     console.log(`  ♻️  Loaded ${saved.length} cached URLs`);
     return new Set(saved);
   }
@@ -59,8 +85,18 @@ async function collectUrlsForCategory(store, startUrl, urlsCachePath) {
     await new Promise(r => setTimeout(r, 1500));
   }
 
-  writeJson(urlsCachePath, [...productUrls]);
-  console.log(`  💾 Saved ${productUrls.size} URLs to cache`);
+  // FIX Bug 2: never write an empty cache file.
+  // If Bright Data returned a challenge/empty page, writing [] here would
+  // poison the cache permanently (until manually deleted). Now we only
+  // write the file when we actually found URLs, so the next run will
+  // attempt a real fetch instead of loading an empty cache.
+  if (productUrls.size > 0) {
+    writeJson(urlsCachePath, [...productUrls]);
+    console.log(`  💾 Saved ${productUrls.size} URLs to cache`);
+  } else {
+    console.log(`  ⚠️  0 URLs found — cache NOT written (will retry fresh next run)`);
+  }
+
   return productUrls;
 }
 
