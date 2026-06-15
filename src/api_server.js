@@ -726,16 +726,27 @@ app.get('/api/category-settings', requireAuth, async (req, res) => {
     pool = await getSqlPool();
     const result = await pool.request().query(`
       SELECT
-        CategoryName,
-        GST,
-        CostOfBusiness,
-        ProfitMargin,
-        ScrapFreqDays,
-        IsScrapEnabled,
-        UpdatedAt,
-        UpdatedBy
-      FROM CategorySettings
-      ORDER BY CategoryName
+        cs.CategoryName,
+        cs.GST,
+        cs.CostOfBusiness,
+        cs.ProfitMargin,
+        cs.ScrapFreqDays,
+        cs.IsScrapEnabled,
+        cs.UpdatedAt,
+        cs.UpdatedBy,
+        MAX(ip.LastScrapedAt) AS LastScrapedAt
+      FROM CategorySettings cs
+      LEFT JOIN InternalProducts ip ON ip.Category = cs.CategoryName
+      GROUP BY
+        cs.CategoryName,
+        cs.GST,
+        cs.CostOfBusiness,
+        cs.ProfitMargin,
+        cs.ScrapFreqDays,
+        cs.IsScrapEnabled,
+        cs.UpdatedAt,
+        cs.UpdatedBy
+      ORDER BY cs.CategoryName
     `);
     console.log(`✅ /api/category-settings — ${result.recordset.length} rows`);
     res.json({ success: true, data: result.recordset });

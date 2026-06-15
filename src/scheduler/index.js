@@ -637,8 +637,11 @@ async function runManualScraper(options = {}) {
           totalPushed += pushed;
         }
 
-        // Important:
-        // Manual scraping does NOT update LastScrapedAt or NextScrapDueAt.
+        // Update LastScrapedAt only — does NOT touch NextScrapDueAt
+        // so the auto-scheduler's due-date logic stays unaffected.
+        await updateManualScrapedAt(pool, entry.categoryName);
+        log(`LastScrapedAt updated for ${entry.categoryName}`);
+
         jobsDone++;
       } catch (err) {
         log(`Failed ${entry.categoryName} -> ${store.name}/${category.slug}: ${err.message}`);
