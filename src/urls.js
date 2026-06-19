@@ -122,7 +122,6 @@ const STORES = [
   parser: require('./parsers/fgtech'),
   categories: [
     {slug: 'ram-memory', url: 'https://fgtechstore.com/product-category/memory-and-storage-solutions/desktop-and-laptop-ram/'},
-  //  {slug: 'desktop & laptop rams', url: 'https://fgtechstore.com/product-category/memory-and-storage-solutions/desktop-and-laptop-ram/'}
   ]
 }
 
