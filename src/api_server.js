@@ -1153,11 +1153,14 @@ app.get('/api/scraper-job/:jobId/logs', requireRole(['admin', 'supervisor']), (r
 app.get(
   '/api/scraper-categories',
   requireRole(['admin', 'supervisor']),
-  (req, res) => {
-    res.json({
-      success: true,
-      data: getManualScraperCategories(),
-    });
+  async (req, res) => {
+    try {
+      const data = await getManualScraperCategories();
+      res.json({ success: true, data });
+    } catch (err) {
+      console.error('❌ /api/scraper-categories error:', err.message);
+      res.status(500).json({ success: false, error: err.message });
+    }
   }
 );
 

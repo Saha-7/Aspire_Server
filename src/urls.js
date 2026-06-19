@@ -127,7 +127,7 @@ const STORES = [
   parser: require('./parsers/fgtech'),
   categories: [
     // Memory & Storage
-  //  {slug: 'ram-memory', url: 'https://fgtechstore.com/product-category/memory-and-storage-solutions/desktop-and-laptop-ram/'},
+    {slug: 'ram-memory', url: 'https://fgtechstore.com/product-category/memory-and-storage-solutions/desktop-and-laptop-ram/'},
     { slug: 'hdd', url: 'https://fgtechstore.com/product-category/memory-and-storage-solutions/internal-and-external-hard-drives/'},
     { slug: 'memory-cards-microsd', url: 'https://fgtechstore.com/product-category/memory-and-storage-solutions/memory-cards-and-microsd/'},
     { slug: 'nas', url: 'https://fgtechstore.com/product-category/memory-and-storage-solutions/nas-storage-systems/'},
