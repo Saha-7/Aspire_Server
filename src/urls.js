@@ -33,6 +33,7 @@ const STORES = [
   //   ],
   // },
 
+
   // {
   //   name: "mdcomputers",
   //   parser: require("./parsers/mdcomputers"),
@@ -54,6 +55,7 @@ const STORES = [
   //   {slug: 'cabinet', url: 'https://mdcomputers.in/catalog/cabinet'},
   //   ],
   // },
+
 
 
   // {
@@ -80,6 +82,8 @@ const STORES = [
   //   ],
   // },
 
+
+
   // {
   //   name: "vishal",
   //   parser: require("./parsers/vishal"),
@@ -96,6 +100,7 @@ const STORES = [
   //     { slug: "monitors", url: "https://vishalperipherals.com/collections/monitors"},
   //   ],
   // },
+
 
   
   // {
@@ -121,7 +126,40 @@ const STORES = [
   name: 'fgtech',
   parser: require('./parsers/fgtech'),
   categories: [
-    {slug: 'ram-memory', url: 'https://fgtechstore.com/product-category/memory-and-storage-solutions/desktop-and-laptop-ram/'},
+    // Memory & Storage
+  //  {slug: 'ram-memory', url: 'https://fgtechstore.com/product-category/memory-and-storage-solutions/desktop-and-laptop-ram/'},
+    { slug: 'hdd', url: 'https://fgtechstore.com/product-category/memory-and-storage-solutions/internal-and-external-hard-drives/'},
+    { slug: 'memory-cards-microsd', url: 'https://fgtechstore.com/product-category/memory-and-storage-solutions/memory-cards-and-microsd/'},
+    { slug: 'nas', url: 'https://fgtechstore.com/product-category/memory-and-storage-solutions/nas-storage-systems/'},
+    { slug: 'ssd', url: 'https://fgtechstore.com/product-category/memory-and-storage-solutions/ssd-and-nvme-drives/'},
+    { slug: 'usb-flash-drives', url: 'https://fgtechstore.com/product-category/memory-and-storage-solutions/usb-flash-drives/'},
+
+    //Surveillance & Security
+    { slug: 'ip-cameras', url: 'https://fgtechstore.com/product-category/surveillance-cctv-cameras/ip-cameras/'},
+    { slug: 'memory-cards', url: 'https://fgtechstore.com/product-category/surveillance-cctv-cameras/memory-cards/'},
+    { slug: 'nvr', url: 'https://fgtechstore.com/product-category/surveillance-cctv-cameras/nvr/'},
+    { slug: 'smart-wifi-cameras', url: 'https://fgtechstore.com/product-category/surveillance-cctv-cameras/smart-wifi-cameras/'},
+    { slug: 'storage-devices', url: 'https://fgtechstore.com/product-category/surveillance-cctv-cameras/storage-devices/'},
+    
+    //Networking Devices
+    { slug: 'fiber-optic-cables', url: 'https://fgtechstore.com/product-category/networking-devices/fiber-optic-cables/'},
+    { slug: 'firewall-and-cloud-controllers', url: 'https://fgtechstore.com/product-category/networking-devices/firewall-and-cloud-controllers/'},
+    { slug: 'network-adapters-and-accessories', url: 'https://fgtechstore.com/product-category/networking-devices/network-adapters-and-accessories/'},
+    { slug: 'network-switches', url: 'https://fgtechstore.com/product-category/networking-devices/network-switches/'},
+    { slug: 'poe-switch', url: 'https://fgtechstore.com/product-category/networking-devices/poe-switch/'},
+    { slug: 'point-to-point-wireless-radio', url: 'https://fgtechstore.com/product-category/networking-devices/point-to-point-wireless-radio/'},
+    { slug: 'routers', url: 'https://fgtechstore.com/product-category/networking-devices/routers/'},
+    { slug: 'wireless-access-point', url: 'https://fgtechstore.com/product-category/networking-devices/wireless-access-point/'},
+    
+    //
+    { slug: 'hd-cameras-and-webcam', url: 'https://fgtechstore.com/product-category/audio-and-video/hd-cameras-and-webcam/'},
+    { slug: 'projectors-and-speakers', url: 'https://fgtechstore.com/product-category/audio-and-video/projectors-and-speakers/'},
+    { slug: 'voip', url: 'https://fgtechstore.com/product-category/audio-and-video/voip/'},
+    // { slug: '', url: ''},
+    // { slug: '', url: ''},
+    // { slug: '', url: ''},
+    // { slug: '', url: ''},
+    // { slug: '', url: ''},
   ]
 }
 
