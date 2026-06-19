@@ -135,6 +135,21 @@ function mapProduct(product) {
     };
   }
 
+  if (store === 'fgtech') {
+    return {
+      ScrapID        : uuidv4(),
+      SKU            : firstSku( product.sku, product.modelNumber),
+      Name           : product.name || null,
+      CompetitorPrice: parsePrice(product.salePrice),
+      ProductURL     : product.url || null,
+      StockStatus    : product.stockStatus || null,
+      StoreName      : 'fgtech',
+      Category       : product.category || null,
+      ScrapedAt      : product.scrapedAt || null,
+    };
+  }
+  
+
   return null;
 }
 
