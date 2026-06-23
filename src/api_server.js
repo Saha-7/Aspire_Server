@@ -15,6 +15,8 @@ const {
   buildCompetitorMap,
   generateRecommendations,
   updateRecommendedSP,
+  resolveEffectivePP,   // ← NEW
+  getBusinessVars,      // ← NEW
 } = require('./recommendation_engine');
 
 const { scrapeProduct }    = require('./scraper/scrapeProduct');
@@ -150,27 +152,80 @@ app.post('/auth/logout', (req, res) => {
 
 
 // ── SQL connection with token cache ──────────────────────────
-let _cachedToken    = null;
-let _tokenExpiresAt = 0;
+// let _cachedToken    = null;
+// let _tokenExpiresAt = 0;
+
+// async function getSqlPool() {
+//   const now = Date.now();
+
+//   if (!_cachedToken || now >= _tokenExpiresAt - 5 * 60 * 1000) {
+//     const credential = process.env.AZURE_ENV === 'production'
+//       ? new ManagedIdentityCredential({ clientId: process.env.db_userclientid })
+//       : new AzureCliCredential();
+
+//     const tokenResponse = await credential.getToken(
+//       'https://database.windows.net/.default'
+//     );
+
+//     _cachedToken    = tokenResponse.token;
+//     _tokenExpiresAt = tokenResponse.expiresOnTimestamp ?? (now + 55 * 60 * 1000);
+//     console.log('🔑 Azure token refreshed');
+//   }
+
+//   return await sql.connect({
+//     server  : process.env.db_serverendpoint,
+//     database: 'db_tpstechautomata',
+//     authentication: {
+//       type   : 'azure-active-directory-access-token',
+//       options: { token: _cachedToken },
+//     },
+//     options: {
+//       encrypt              : true,
+//       trustServerCertificate: false,
+//       requestTimeout       : 60_000,
+//     },
+//   });
+// }
+
+// ── SQL connection — persistent pool, NOT closed per-request ──
+let _sqlPool         = null;
+let _cachedToken     = null;
+let _tokenExpiresAt  = 0;
 
 async function getSqlPool() {
   const now = Date.now();
 
+  // Refresh AAD token if missing or expiring soon
   if (!_cachedToken || now >= _tokenExpiresAt - 5 * 60 * 1000) {
     const credential = process.env.AZURE_ENV === 'production'
       ? new ManagedIdentityCredential({ clientId: process.env.db_userclientid })
       : new AzureCliCredential();
 
-    const tokenResponse = await credential.getToken(
-      'https://database.windows.net/.default'
-    );
-
+    const tokenResponse = await credential.getToken('https://database.windows.net/.default');
     _cachedToken    = tokenResponse.token;
     _tokenExpiresAt = tokenResponse.expiresOnTimestamp ?? (now + 55 * 60 * 1000);
     console.log('🔑 Azure token refreshed');
+
+    // Token rotated — drop the old pool so the next connect uses the fresh token
+    if (_sqlPool) {
+      try { await _sqlPool.close(); } catch (_) {}
+      _sqlPool = null;
+    }
   }
 
-  return await sql.connect({
+  // Reuse the existing pool if it's still connected
+  if (_sqlPool && _sqlPool.connected) {
+    return _sqlPool;
+  }
+
+//   console.log('🔌 Opening new SQL connection pool...');
+//   console.log('========================');
+// console.log('db_serverendpoint =', process.env.db_serverendpoint);
+// console.log('AZURE_ENV =', process.env.AZURE_ENV);
+// console.log('Token exists =', !!_cachedToken);
+// console.log('Token length =', _cachedToken?.length);
+// console.log('========================');
+  _sqlPool = await new sql.ConnectionPool({
     server  : process.env.db_serverendpoint,
     database: 'db_tpstechautomata',
     authentication: {
@@ -182,8 +237,18 @@ async function getSqlPool() {
       trustServerCertificate: false,
       requestTimeout       : 60_000,
     },
-  });
+    pool: {
+      max: 10,
+      min: 0,
+      idleTimeoutMillis: 30000,
+    },
+  }).connect();
+
+  return _sqlPool;
 }
+
+
+
 
 // ── Helper: find store config by product URL ──────────────────
 function findStoreByUrl(productUrl) {
@@ -299,6 +364,53 @@ app.get('/api/recommendations', async (req, res) => {
     if (pool) await pool.close();
   }
 });
+
+
+
+// ── GET /api/internal-recommendations ─────────────────────────
+// Internal-data-only RecommendedSP — no competitor matching at all.
+// Eligibility: PP available + isActive + isInStock (same filter as
+// loadInternalProducts). Computed live on every request — cheap,
+// deterministic, no job/polling needed.
+app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
+  let pool;
+  try {
+    pool = await getSqlPool();
+
+    const categorySettings = await loadCategorySettings(pool);
+    const internalProducts = await loadInternalProducts(pool);
+
+    const rows = internalProducts.map(product => {
+      const { effectivePP, source } = resolveEffectivePP(product);
+      const { gst, costOfBusiness, profitMargin } = getBusinessVars(categorySettings, product.Category);
+      const multiplier     = 1 + gst + costOfBusiness + profitMargin;
+      const recommendedSP  = parseFloat((effectivePP * multiplier).toFixed(2));
+
+      return {
+        SKU_ID       : product.SKU_ID,
+        Title        : product.Title,
+        Category     : product.Category,
+        PP           : effectivePP,
+        PPSource     : source,
+        SP           : product.SP != null ? parseFloat(product.SP) : null,
+        RecommendedSP: recommendedSP,
+        GSTPct       : parseFloat((gst * 100).toFixed(2)),
+        COBPct       : parseFloat((costOfBusiness * 100).toFixed(2)),
+        MarginPct    : parseFloat((profitMargin * 100).toFixed(2)),
+      };
+    });
+
+    console.log(`✅ /api/internal-recommendations — ${rows.length} eligible internal products`);
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    console.error('❌ /api/internal-recommendations error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
 
 
 // ── POST /api/refresh-product ─────────────────────────────────
