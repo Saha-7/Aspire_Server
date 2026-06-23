@@ -320,4 +320,6 @@ module.exports = {
   buildCompetitorMap,
   generateRecommendations,
   updateRecommendedSP,
+  resolveEffectivePP,   // ← NEW
+  getBusinessVars,      // ← NEW
 };
