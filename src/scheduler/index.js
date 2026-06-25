@@ -39,6 +39,18 @@
 
 require('dotenv').config();
 
+
+//
+const { v4: uuidv4 } = require('uuid');
+const {
+  loadInternalSkuSets,
+  computeStatsForBatch,
+  saveRunStats,
+} = require('../services/scrapeStatsService');
+//
+
+
+
 const fs   = require('fs');
 const sql  = require('mssql');
 const { AzureCliCredential, ManagedIdentityCredential } = require('@azure/identity');
@@ -607,9 +619,15 @@ async function updateManualScrapedAt(pool, categoryName) {
     `);
 }
 
+
+
 async function runManualScraper(options = {}) {
   const log = options.log || console.log;
   const isCancelled = options.isCancelled || (() => false);
+
+  const runId        = options.runId        || uuidv4();
+  const startedBy    = options.startedBy     || null;
+  const runStartedAt = options.runStartedAt  || new Date();
 
   const selectedCategories = [...new Set(
     (options.categoryNames || [])
@@ -626,6 +644,7 @@ async function runManualScraper(options = {}) {
   let totalScraped = 0;
   let totalPushed = 0;
   let totalFailed = 0;
+  const statsRows = [];
 
   log('Manual scraper starting...');
 
@@ -633,9 +652,6 @@ async function runManualScraper(options = {}) {
     pool = await getSqlPool();
     log('Connected to SQL');
 
-    // Load live scraper config from CategoryMappings (DB-driven).
-    // Must happen before validating selectedCategories, since the
-    // "known categories" set now comes from the DB, not a hardcoded array.
     const scraperConfig = await loadScraperConfigFromDB(pool);
 
     if (scraperConfig.length === 0) {
@@ -655,10 +671,12 @@ async function runManualScraper(options = {}) {
     log(`Selected categories: ${selectedCategories.length}`);
     log(`Store/category mapping rows: ${scrapeEntries.length}`);
 
-    // ── Group by storeName+slug — scrape each store page once even
-    // if it maps to multiple selected internal categories ──────────
     const entryGroups = groupByStoreSlug(scrapeEntries);
     log(`Unique store pages to scrape: ${entryGroups.length}`);
+
+    log('Loading internal product SKUs for match diagnostics...');
+    const skuSets = await loadInternalSkuSets(pool);
+    log(`Internal SKUs known: ${skuSets.allSkuSet.size} | eligible for recommendations: ${skuSets.eligibleSkuSet.size}`);
 
     for (const group of entryGroups) {
       if (isCancelled()) {
@@ -672,6 +690,13 @@ async function runManualScraper(options = {}) {
         log(`Config error: ${group.storeName}/${group.slug} not found in urls.js`);
         log(`Affected categories: ${group.categoryNames.join(', ')}`);
         totalFailed++;
+        statsRows.push({
+          runId, runStartedAt, startedBy,
+          storeName: group.storeName, storeSlug: group.slug,
+          categoryNames: group.categoryNames,
+          status: 'error',
+          errorMessage: 'Store/slug not found in urls.js',
+        });
         continue;
       }
 
@@ -685,6 +710,16 @@ async function runManualScraper(options = {}) {
         const result = await scrapeCategory(store, category);
 
         log(`Scraped: ${result.saved} products | Failed: ${result.failed}`);
+
+        const stats = computeStatsForBatch(result.products || [], skuSets);
+        statsRows.push({
+          runId, runStartedAt, startedBy,
+          storeName: store.name, storeSlug: category.slug,
+          categoryNames: group.categoryNames,
+          status: 'ok',
+          stats,
+        });
+        log(`Matched (strict/simple): ${stats.MatchedStrict}/${stats.MatchedSimple} | No SKU: ${stats.NullOrEmptySku} | No internal match: ${stats.SkuNoInternalMatch}`);
 
         if (result.saved === 0) {
           log('0 products scraped - scheduler dates not updated.');
@@ -704,9 +739,6 @@ async function runManualScraper(options = {}) {
           totalPushed += pushed;
         }
 
-        // Update LastScrapedAt only — does NOT touch NextScrapDueAt
-        // so the auto-scheduler's due-date logic stays unaffected.
-        // Stamp for EVERY internal category this store/slug maps to.
         for (const categoryName of group.categoryNames) {
           await updateManualScrapedAt(pool, categoryName);
         }
@@ -716,7 +748,20 @@ async function runManualScraper(options = {}) {
       } catch (err) {
         log(`Failed ${store.name}/${category.slug}: ${err.message}`);
         totalFailed++;
+        statsRows.push({
+          runId, runStartedAt, startedBy,
+          storeName: store.name, storeSlug: category.slug,
+          categoryNames: group.categoryNames,
+          status: 'error',
+          errorMessage: err.message,
+        });
       }
+    }
+
+    if (statsRows.length > 0) {
+      log('Saving scrape diagnostics...');
+      await saveRunStats(pool, statsRows);
+      log(`Saved diagnostics for ${statsRows.length} store/category batches (RunId=${runId})`);
     }
 
     if (jobsDone > 0) {
@@ -735,6 +780,138 @@ async function runManualScraper(options = {}) {
     if (pool) await pool.close();
   }
 }
+
+
+
+
+// async function runManualScraper(options = {}) {
+//   const log = options.log || console.log;
+//   const isCancelled = options.isCancelled || (() => false);
+
+//   const selectedCategories = [...new Set(
+//     (options.categoryNames || [])
+//       .map(category => String(category).trim())
+//       .filter(Boolean)
+//   )];
+
+//   if (selectedCategories.length === 0) {
+//     throw new Error('Select at least one category to scrape.');
+//   }
+
+//   let pool;
+//   let jobsDone = 0;
+//   let totalScraped = 0;
+//   let totalPushed = 0;
+//   let totalFailed = 0;
+
+//   log('Manual scraper starting...');
+
+//   try {
+//     pool = await getSqlPool();
+//     log('Connected to SQL');
+
+//     // Load live scraper config from CategoryMappings (DB-driven).
+//     // Must happen before validating selectedCategories, since the
+//     // "known categories" set now comes from the DB, not a hardcoded array.
+//     const scraperConfig = await loadScraperConfigFromDB(pool);
+
+//     if (scraperConfig.length === 0) {
+//       throw new Error('No category mappings found in DB. Map categories in Settings → Category Mapping first.');
+//     }
+
+//     const knownCategories = new Set(scraperConfig.map(entry => entry.categoryName));
+//     const unknownCategories = selectedCategories.filter(category => !knownCategories.has(category));
+
+//     if (unknownCategories.length > 0) {
+//       throw new Error(`Unknown scraper categories: ${unknownCategories.join(', ')}`);
+//     }
+
+//     const selectedSet   = new Set(selectedCategories);
+//     const scrapeEntries = scraperConfig.filter(entry => selectedSet.has(entry.categoryName));
+
+//     log(`Selected categories: ${selectedCategories.length}`);
+//     log(`Store/category mapping rows: ${scrapeEntries.length}`);
+
+//     // ── Group by storeName+slug — scrape each store page once even
+//     // if it maps to multiple selected internal categories ──────────
+//     const entryGroups = groupByStoreSlug(scrapeEntries);
+//     log(`Unique store pages to scrape: ${entryGroups.length}`);
+
+//     for (const group of entryGroups) {
+//       if (isCancelled()) {
+//         log(`Cancellation requested - stopping after ${jobsDone} jobs.`);
+//         break;
+//       }
+
+//       const resolved = resolveStoreConfig(group.storeName, group.slug);
+
+//       if (!resolved) {
+//         log(`Config error: ${group.storeName}/${group.slug} not found in urls.js`);
+//         log(`Affected categories: ${group.categoryNames.join(', ')}`);
+//         totalFailed++;
+//         continue;
+//       }
+
+//       const { store, category } = resolved;
+
+//       log(`Starting ${store.name}/${category.slug} -> maps to: ${group.categoryNames.join(', ')}`);
+
+//       clearCategoryCache(store.name, category.slug);
+
+//       try {
+//         const result = await scrapeCategory(store, category);
+
+//         log(`Scraped: ${result.saved} products | Failed: ${result.failed}`);
+
+//         if (result.saved === 0) {
+//           log('0 products scraped - scheduler dates not updated.');
+//           totalFailed++;
+//           continue;
+//         }
+
+//         totalScraped += result.saved;
+
+//         if (result.products?.length > 0) {
+//           const { pushed } = await pushScrapedDataToCosmos(
+//             result.products,
+//             `${store.name}/${category.slug}`,
+//             log
+//           );
+
+//           totalPushed += pushed;
+//         }
+
+//         // Update LastScrapedAt only — does NOT touch NextScrapDueAt
+//         // so the auto-scheduler's due-date logic stays unaffected.
+//         // Stamp for EVERY internal category this store/slug maps to.
+//         for (const categoryName of group.categoryNames) {
+//           await updateManualScrapedAt(pool, categoryName);
+//         }
+//         log(`LastScrapedAt updated for: ${group.categoryNames.join(', ')}`);
+
+//         jobsDone += group.categoryNames.length;
+//       } catch (err) {
+//         log(`Failed ${store.name}/${category.slug}: ${err.message}`);
+//         totalFailed++;
+//       }
+//     }
+
+//     if (jobsDone > 0) {
+//       log('Running cleanup mapper...');
+//       await runCleanupMapper(log);
+//     } else {
+//       log('No jobs completed - skipping cleanup mapper.');
+//     }
+
+//     log('Manual scraper finished.');
+//     log(`Jobs done: ${jobsDone}`);
+//     log(`Products scraped: ${totalScraped}`);
+//     log(`Cosmos pushed: ${totalPushed}`);
+//     log(`Failed/skipped: ${totalFailed}`);
+//   } finally {
+//     if (pool) await pool.close();
+//   }
+// }
 
 
 

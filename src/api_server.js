@@ -2,6 +2,14 @@
 // Run: node src/api_server.js
 
 require('dotenv').config();
+
+
+//
+const { getRecentRuns, getRunDetail } = require('./services/scrapeStatsService');
+//
+
+
+
 const express  = require('express');
 const cors     = require('cors');
 const sql      = require('mssql');
@@ -1179,12 +1187,22 @@ if (categoryNames.length === 0) {
   // Fire and forget
   (async () => {
     try {
-      await runManualScraper({
+//       await runManualScraper({
+//   categoryNames,
+//   log        : jobLog,
+//   isCancelled: () => job.cancelRequested,
+// });
+
+//
+await runManualScraper({
   categoryNames,
   log        : jobLog,
   isCancelled: () => job.cancelRequested,
+  runId      : id,
+  startedBy,
+  runStartedAt: new Date(job.startedAt),
 });
-
+//
       if (job.cancelRequested) {
         job.status     = 'cancelled';
         job.finishedAt = new Date().toISOString();
@@ -1262,9 +1280,7 @@ app.get('/api/scraper-job/:jobId/logs', requireRole(['admin', 'supervisor']), (r
 
 
 
-app.get(
-  '/api/scraper-categories',
-  requireRole(['admin', 'supervisor']),
+app.get('/api/scraper-categories',requireRole(['admin', 'supervisor']),
   async (req, res) => {
     try {
       const data = await getManualScraperCategories();
@@ -1275,6 +1291,34 @@ app.get(
     }
   }
 );
+
+app.get('/api/scrape-stats/runs', requireRole(['admin', 'supervisor']), async (req, res) => {
+  let pool;
+  try {
+    pool = await getSqlPool();
+    const data = await getRecentRuns(pool, parseInt(req.query.limit) || 25);
+    res.json({ success: true, data });
+  } catch (err) {
+    console.error('❌ /api/scrape-stats/runs error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+app.get('/api/scrape-stats/:runId', requireRole(['admin', 'supervisor']), async (req, res) => {
+  let pool;
+  try {
+    pool = await getSqlPool();
+    const data = await getRunDetail(pool, req.params.runId);
+    res.json({ success: true, data });
+  } catch (err) {
+    console.error('❌ /api/scrape-stats/:runId error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
 
 
 // ── GET /api/health ───────────────────────────────────────────
