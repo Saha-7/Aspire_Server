@@ -5,7 +5,7 @@ require('dotenv').config();
 
 
 //
-const { getRecentRuns, getRunDetail } = require('./services/scrapeStatsService');
+const { getRecentRuns, getRunDetail, getRunSkuMatches, buildSkuMatchesCsv } = require('./services/scrapeStatsService');
 //
 
 
@@ -1319,6 +1319,26 @@ app.get('/api/scrape-stats/:runId', requireRole(['admin', 'supervisor']), async 
     if (pool) await pool.close();
   }
 });
+
+app.get('/api/scrape-stats/:runId/sku-matches.csv', requireRole(['admin', 'supervisor']), async (req, res) => {
+  let pool;
+  try {
+    pool = await getSqlPool();
+    const { runId, rows } = await getRunSkuMatches(pool, req.params.runId);
+    const csv = buildSkuMatchesCsv(rows);
+
+    const filename = `scrape-sku-matches-${runId || 'none'}.csv`;
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(csv);
+  } catch (err) {
+    console.error('❌ /api/scrape-stats/:runId/sku-matches.csv error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
 
 
 // ── GET /api/health ───────────────────────────────────────────
