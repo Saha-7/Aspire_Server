@@ -188,20 +188,26 @@ async function upsertManyFromCosmos(products) {
       .query(`
         MERGE CompetitorPrices AS target
         USING (
+          -- FIX: was GROUP BY with independent MIN(CompetitorPrice) / MAX(ScrapedAt),
+          -- which was fine for same-run pagination dupes but silently mixed an
+          -- old (possibly cheapest-ever) price with a recent-looking timestamp
+          -- once cleanup_mapper started reading Cosmos's FULL history (all runs,
+          -- all time) instead of just the current run. This picks the single
+          -- actual latest-scraped row per SKU+Store — price and its own
+          -- timestamp always travel together.
           SELECT
-            SKU,
-            StoreName,
-            -- If same SKU+Store appears twice (pagination dupe), keep lowest price
-            MIN(CompetitorPrice)                    AS CompetitorPrice,
-            MAX(StockStatus)                        AS StockStatus,
-            MAX(ScrapedAt)                          AS ScrapedAt,
-            MAX(ScrapID)                            AS ScrapID,
-            MAX(Name)                               AS Name,
-            MAX(ProductURL)                         AS ProductURL,
-            MAX(Category)                           AS Category
-          FROM @tvp
-          WHERE SKU IS NOT NULL
-          GROUP BY SKU, StoreName
+            SKU, StoreName, CompetitorPrice, StockStatus,
+            ScrapedAt, ScrapID, Name, ProductURL, Category
+          FROM (
+            SELECT *,
+              ROW_NUMBER() OVER (
+                PARTITION BY SKU, StoreName
+                ORDER BY TRY_CONVERT(datetime2, ScrapedAt) DESC
+              ) AS rn
+            FROM @tvp
+            WHERE SKU IS NOT NULL
+          ) ranked
+          WHERE rn = 1
         ) AS source
           ON target.SKU       = source.SKU
          AND target.StoreName = source.StoreName
