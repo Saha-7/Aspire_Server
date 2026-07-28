@@ -229,6 +229,45 @@ async function getSqlPool() {
   });
 }
 
+// ── FIX: AAD access tokens expire after ~60-90 min. Long manual
+// scraper runs (many categories, or one big one like 1338 products)
+// regularly outlive that window, so a `pool` grabbed once at the
+// start of the job goes stale before the diagnostics/stats writes
+// at the end — surfacing as "Connection is closed".
+//
+// getHealthySqlPool() re-authenticates with a fresh AAD token
+// whenever the current pool looks dead, and is safe to call as
+// often as needed (cheap no-op when the pool is still alive).
+// Callers should always reassign: pool = await getHealthySqlPool(pool);
+async function getHealthySqlPool(existingPool) {
+  if (existingPool && existingPool.connected) {
+    return existingPool;
+  }
+  if (existingPool) {
+    try { await existingPool.close(); } catch (_) { /* already dead, ignore */ }
+  }
+  return await getSqlPool();
+}
+
+// ── Runs a SQL operation with one automatic reconnect-and-retry
+// if it fails with a stale/closed connection. Returns the (possibly
+// new) pool alongside the result so the caller can keep using it.
+async function withSqlRetry(pool, fn, { log = console.log, label = 'SQL operation' } = {}) {
+  try {
+    const result = await fn(pool);
+    return { pool, result };
+  } catch (err) {
+    const isConnIssue = /closed|connection|ECONNRESET|ETIMEOUT|ESOCKET/i.test(err.message || '');
+    if (!isConnIssue) throw err;
+
+    log(`⚠️  ${label} failed (${err.message}) — reconnecting and retrying once...`);
+    pool = await getHealthySqlPool(null); // force a brand-new pool + fresh token
+    const result = await fn(pool);
+    log(`✅ ${label} succeeded after reconnect`);
+    return { pool, result };
+  }
+}
+
 // ── Load schedule only for categories we actually scrape ──────
 // Only queries for categories present in the live scraperConfig
 // (loaded from CategoryMappings). Ignores all Shopify-only
@@ -750,8 +789,17 @@ async function runManualScraper(options = {}) {
           totalPushed += pushed;
         }
 
+        // FIX: re-check pool health before every SQL write in the loop —
+        // a category that scrapes slowly (many products) can push us past
+        // the AAD token's ~60-90 min lifetime mid-job, well before we ever
+        // reach the final diagnostics save.
+        pool = await getHealthySqlPool(pool);
         for (const categoryName of group.categoryNames) {
-          await updateManualScrapedAt(pool, categoryName);
+          ({ pool } = await withSqlRetry(
+            pool,
+            (p) => updateManualScrapedAt(p, categoryName),
+            { log, label: `updateManualScrapedAt(${categoryName})` }
+          ));
         }
         log(`LastScrapedAt updated for: ${group.categoryNames.join(', ')}`);
 
@@ -769,22 +817,68 @@ async function runManualScraper(options = {}) {
       }
     }
 
+    // FIX: refresh the pool one more time before the final writes — by
+    // this point the job may have run long enough for the AAD token
+    // fetched at the very start to have expired. withSqlRetry() also
+    // covers the case where it dies mid-write. Neither of these two
+    // blocks is allowed to throw: a diagnostics-write failure must NOT
+    // overwrite an otherwise-successful scrape+Cosmos-push run with a
+    // "Fatal error" — see FIX note on jobsDone check below.
+    let diagnosticsSaved = false;
     if (statsRows.length > 0) {
       log('Saving scrape diagnostics...');
-      await saveRunStats(pool, statsRows);
-      log(`Saved diagnostics for ${statsRows.length} store/category batches (RunId=${runId})`);
+      try {
+        pool = await getHealthySqlPool(pool);
+        ({ pool } = await withSqlRetry(
+          pool,
+          (p) => saveRunStats(p, statsRows),
+          { log, label: 'saveRunStats' }
+        ));
+        log(`Saved diagnostics for ${statsRows.length} store/category batches (RunId=${runId})`);
+        diagnosticsSaved = true;
+      } catch (err) {
+        log(`❌ Diagnostics save failed even after reconnect: ${err.message}`);
+        log(`⚠️  Scrape + Cosmos push for this run were NOT lost — only the`);
+        log(`   Scrape Stats page row is missing. RunId=${runId} needs a manual backfill.`);
+      }
     }
 
     // ── Persist matched-SKU rows for the CSV export ──────────────────
+    let skuMatchesSaved = false;
     if (skuMatchRows.length > 0) {
       log('Saving matched-SKU rows for CSV export...');
-      await saveSkuMatchRows(pool, skuMatchRows);
-      log(`Saved ${skuMatchRows.length} matched SKUs (RunId=${runId})`);
+      try {
+        pool = await getHealthySqlPool(pool);
+        ({ pool } = await withSqlRetry(
+          pool,
+          (p) => saveSkuMatchRows(p, skuMatchRows),
+          { log, label: 'saveSkuMatchRows' }
+        ));
+        log(`Saved ${skuMatchRows.length} matched SKUs (RunId=${runId})`);
+        skuMatchesSaved = true;
+      } catch (err) {
+        log(`❌ SKU match rows save failed even after reconnect: ${err.message}`);
+        log(`   RunId=${runId} needs a manual backfill for ScrapeRunSkuMatches too.`);
+      }
+    }
+
+    if (!diagnosticsSaved || !skuMatchesSaved) {
+      log(`⚠️  Diagnostics incomplete for RunId=${runId} — Scrape Stats page will not show this run until backfilled.`);
     }
 
     if (jobsDone > 0) {
       log('Running cleanup mapper...');
-      await runCleanupMapper(log);
+      try {
+        await runCleanupMapper(log);
+      } catch (err) {
+        // FIX: cleanup mapper (Cosmos -> CompetitorPrices) is also a
+        // long-ish DB operation and was previously unguarded — a failure
+        // here used to throw all the way out and get logged as the job's
+        // "Fatal error", even though scraping/Cosmos/diagnostics above
+        // may all have already succeeded.
+        log(`❌ Cleanup mapper failed: ${err.message}`);
+        log(`   CompetitorPrices may be stale for this run — rerun cleanup_mapper.js manually if needed.`);
+      }
     } else {
       log('No jobs completed - skipping cleanup mapper.');
     }
