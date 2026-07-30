@@ -33,6 +33,31 @@ function absoluteUrl(href) {
 
 /*
 |--------------------------------------------------------------------------
+| CATEGORY
+|--------------------------------------------------------------------------
+| FIX: category was previously hardcoded to 'Processor' for every
+| product regardless of what was actually scraped — left over from
+| when this parser was first written for the Processor category, never
+| updated when reused for Monitors and others. Derive it instead from
+| the collection slug already present in the URL, e.g.
+| ".../collections/monitors/products/..." -> "Monitors".
+*/
+
+function categoryFromUrl(url) {
+  if (!url) return null;
+
+  const match = url.match(/\/collections\/([^/]+)\/products\//i);
+
+  if (!match) return null;
+
+  return match[1]
+    .split('-')
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+}
+
+/*
+|--------------------------------------------------------------------------
 | PRODUCT LINKS
 |--------------------------------------------------------------------------
 */
@@ -146,13 +171,33 @@ const originalPrice =
   |--------------------------------------------------------------------------
   | STOCK
   |--------------------------------------------------------------------------
+  | FIX: this site marks unavailable products as "Unavailable" (with a
+  | "NOTIFY ME" button) — it never uses the literal strings "Out of stock"
+  | or "Sold out" anywhere on the page, so the old check below always
+  | fell through to 'In Stock' regardless of real availability.
+  | Read the structured "Availability:" label/span field (same pattern
+  | used for Model Number below) first, and fall back to a broader
+  | bodyText check that also covers "unavailable".
   */
 
-  const stockStatus =
-    bodyText.includes('Out of stock') ||
-    bodyText.includes('Sold out')
-      ? 'Out of Stock'
-      : 'In Stock';
+  let availabilityText = null;
+
+  $('label').each((_, el) => {
+    const labelText = cleanText($(el).text());
+
+    if (
+      labelText &&
+      labelText.toLowerCase().includes('availability')
+    ) {
+      availabilityText = cleanText($(el).next('span').text());
+    }
+  });
+
+  const stockStatus = /unavailable|out of stock|sold out/i.test(
+    availabilityText || bodyText
+  )
+    ? 'Out of Stock'
+    : 'In Stock';
 
   /*
   |--------------------------------------------------------------------------
@@ -207,16 +252,31 @@ $('label').each((_, el) => {
   |--------------------------------------------------------------------------
   | SKU
   |--------------------------------------------------------------------------
+  | FIX: real SKUs on this site are alphanumeric (e.g. "LS32FG502EWXXL"),
+  | but the old regex only accepted digits (/SKU:\s*([0-9]+)/), so it
+  | never matched the real SKU field and instead grabbed whatever other
+  | numeric "SKU:"-looking text happened to exist elsewhere in the page
+  | (a stray widget/script), or returned null. Read the structured
+  | "SKU:" label/span field directly instead, same pattern as
+  | Model Number and Availability above.
   */
 
   let sku = null;
 
-  const skuMatch =
-    bodyText.match(/SKU:\s*([0-9]+)/i);
+  $('label').each((_, el) => {
+    const labelText = cleanText($(el).text());
 
-  if (skuMatch) {
-    sku = skuMatch[1];
-  }
+    if (
+      labelText &&
+      labelText.toLowerCase().includes('sku')
+    ) {
+      const value = cleanText($(el).next('span').text());
+
+      if (value) {
+        sku = value;
+      }
+    }
+  });
 
   /*
   |--------------------------------------------------------------------------
@@ -294,7 +354,7 @@ $('label').each((_, el) => {
     modelNumber,
     sku,
     brand,
-    category: 'Processor',
+    category: categoryFromUrl(url),
     stockStatus,
     salePrice,
     originalPrice,
@@ -312,4 +372,3 @@ module.exports = {
   getNextPageUrl,
   parseProductDetails,
 };
-
