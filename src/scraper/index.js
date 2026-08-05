@@ -17,6 +17,20 @@
 //   When cancel is requested mid-category, the function returns early
 //   with whatever products were already scraped, and sets cancelled=true
 //   in the return value so the caller knows to stop.
+//
+// FIX 3 (2026-08-04): Duplicate-URL dedup for stores (e.g. Shopify —
+//   confirmed on vishal) that link to the SAME product page via two
+//   different URL forms — e.g. a bare "/products/<handle>" link
+//   (wishlist/quick-view/related-widget) AND a collection-scoped
+//   "/collections/<slug>/products/<handle>" link (main grid) on the
+//   same crawled pages. Both are valid URLs for the identical page,
+//   but as plain strings they're different, so a Set alone doesn't
+//   catch the duplicate — this doubled vishal's Power Supply scrape
+//   count (165 real products -> ~330 scraped). Fixed by deduping on a
+//   canonical form (collection segment stripped) while still keeping
+//   whichever original URL form was first discovered for the actual
+//   scrape, so per-parser category-from-URL logic (e.g. vishal.js)
+//   keeps working unchanged.
 // ─────────────────────────────────────────────────────────────
 
 require('dotenv').config();
@@ -31,6 +45,17 @@ const { log }                                              = require('../../blob
 //  URL COLLECTION
 // ─────────────────────────────────────────────────────────────
 
+// FIX 3: strips an optional "/collections/<slug>" segment immediately
+// before "/products/" so two links pointing at the same product page
+// via different URL forms collapse to the same canonical key.
+// "https://x.com/collections/power-supply/products/foo" and
+// "https://x.com/products/foo" both canonicalize to
+// "https://x.com/products/foo".
+function canonicalizeProductUrl(url) {
+  if (!url) return url;
+  return url.replace(/\/collections\/[^/]+(?=\/products\/)/i, '');
+}
+
 async function collectUrlsForCategory(store, startUrl, urlsCachePath) {
   const saved = readJson(urlsCachePath, null);
 
@@ -43,10 +68,12 @@ async function collectUrlsForCategory(store, startUrl, urlsCachePath) {
   }
 
   const { parser }         = store;
-  const productUrls        = new Set();
+  const productUrls        = new Set(); // URLs we'll actually scrape (original form kept)
+  const seenCanonicalUrls  = new Set(); // dedup key set (collection segment stripped) — FIX 3
   const visitedListingUrls = new Set();
   let currentUrl = startUrl;
   let pageNum    = 1;
+  let dupesSkipped = 0;
 
   while (currentUrl) {
     if (visitedListingUrls.has(currentUrl)) {
@@ -62,7 +89,19 @@ async function collectUrlsForCategory(store, startUrl, urlsCachePath) {
       const html  = await fetchPage(currentUrl);
       const links = parser.parseProductLinks(html);
       console.log(`     ↳ ${links.length} links found`);
-      links.forEach(l => productUrls.add(l));
+
+      // FIX 3: dedup on canonical form, but keep the first-seen original
+      // URL for scraping — preserves any collection-slug info a parser's
+      // category-from-URL logic (e.g. vishal.js) depends on.
+      links.forEach(l => {
+        const canonical = canonicalizeProductUrl(l);
+        if (seenCanonicalUrls.has(canonical)) {
+          dupesSkipped++;
+          return;
+        }
+        seenCanonicalUrls.add(canonical);
+        productUrls.add(l);
+      });
 
       currentUrl = parser.getNextPageUrl(html, currentUrl);
       pageNum++;
@@ -73,6 +112,11 @@ async function collectUrlsForCategory(store, startUrl, urlsCachePath) {
     }
 
     await new Promise(r => setTimeout(r, 1500));
+  }
+
+  if (dupesSkipped > 0) {
+    console.log(`  🧹 Skipped ${dupesSkipped} duplicate-URL-form links (same product, different link form)`);
+    log('INFO', 'index.js', 'collectUrlsForCategory', `Skipped ${dupesSkipped} duplicate-URL-form links for ${startUrl}`);
   }
 
   // FIX: Never write an empty cache file.
@@ -246,10 +290,6 @@ module.exports = { scrapeAll, scrapeCategory };
 
 
 
-
-
-
-
 // // src/scraper/index.js
 // //
 // // CHANGE:
@@ -277,6 +317,7 @@ module.exports = { scrapeAll, scrapeCategory };
 // const { ensureDir, readJson, writeJson, getPaths }         = require('./fileHelpers');
 // const { scrapeAndSave }                                    = require('./scrapeProduct');
 // const { STORES }                                           = require('../urls');
+// const { log }                                              = require('../../blobLogger');
 
 // // ─────────────────────────────────────────────────────────────
 // //  URL COLLECTION
@@ -302,6 +343,7 @@ module.exports = { scrapeAll, scrapeCategory };
 //   while (currentUrl) {
 //     if (visitedListingUrls.has(currentUrl)) {
 //       console.log(`  ⚠️  Pagination loop detected at ${currentUrl} — stopping`);
+//       log('WARN', 'index.js', 'collectUrlsForCategory', `Pagination loop detected at ${currentUrl} — stopping`);
 //       break;
 //     }
 //     visitedListingUrls.add(currentUrl);
@@ -318,6 +360,7 @@ module.exports = { scrapeAll, scrapeCategory };
 //       pageNum++;
 //     } catch (err) {
 //       console.error(`  ❌ Listing page error: ${err.message}`);
+//       log('ERROR', 'index.js', 'collectUrlsForCategory', `Listing page error at ${currentUrl}: ${err.message}`);
 //       break;
 //     }
 
@@ -332,6 +375,7 @@ module.exports = { scrapeAll, scrapeCategory };
 //     console.log(`  💾 Saved ${productUrls.size} URLs to cache`);
 //   } else {
 //     console.log(`  ⚠️  0 URLs found — cache NOT written (will retry fresh next run)`);
+//     log('WARN', 'index.js', 'collectUrlsForCategory', `0 URLs found for ${startUrl} — cache not written`);
 //   }
 
 //   return productUrls;
@@ -360,6 +404,7 @@ module.exports = { scrapeAll, scrapeCategory };
 //   console.log(`\n${'─'.repeat(60)}`);
 //   console.log(`🏪 Store: ${storeName}  📂 Category: ${slug}`);
 //   console.log(`${'─'.repeat(60)}`);
+//   log('INFO', 'index.js', 'scrapeCategory', `Starting store: ${storeName}, category: ${slug}`);
 
 //   const paths = getPaths(storeName, slug);
 //   ensureDir(paths.dir);
@@ -386,6 +431,7 @@ module.exports = { scrapeAll, scrapeCategory };
 //     // between categories. This gives near-immediate stop on cancel.
 //     if (isCancelled()) {
 //       console.log(`  🛑 Cancel requested — stopping after ${saved} products scraped in this category`);
+//       log('WARN', 'index.js', 'scrapeCategory', `Cancel requested — stopped after ${saved} products in ${storeName}/${slug}`);
 //       cancelled = true;
 //       break;
 //     }
@@ -415,6 +461,8 @@ module.exports = { scrapeAll, scrapeCategory };
 //   console.log(`     Saved : ${saved} | Failed: ${failed} | Total: ${done}`);
 //   console.log(`     Full  → ${paths.fullOutput}`);
 //   console.log(`     Price → ${paths.priceOutput}`);
+//   log('INFO', 'index.js', 'scrapeCategory',
+//     `${storeName}/${slug} complete${cancelled ? ' (cancelled)' : ''} — Saved: ${saved}, Failed: ${failed}, Total: ${done}`);
 
 //   return { done, saved, failed, products, cancelled };
 // }
@@ -429,6 +477,7 @@ module.exports = { scrapeAll, scrapeCategory };
 
 //   const totalCategories = stores.reduce((acc, s) => acc + s.categories.length, 0);
 //   console.log(`   Categories : ${totalCategories}\n`);
+//   log('INFO', 'index.js', 'scrapeAll', `Run started — stores: ${stores.map(s => s.name).join(', ')}, total categories: ${totalCategories}`);
 
 //   const results = [];
 
@@ -439,6 +488,7 @@ module.exports = { scrapeAll, scrapeCategory };
 //         results.push({ store: store.name, category: category.slug, ...result, success: true });
 //       } catch (err) {
 //         console.error(`\n❌ Failed: ${store.name}/${category.slug}: ${err.message}`);
+//         log('ERROR', 'index.js', 'scrapeAll', `Failed: ${store.name}/${category.slug}: ${err.message}`);
 //         results.push({ store: store.name, category: category.slug, success: false, error: err.message });
 //       }
 //     }
@@ -446,6 +496,7 @@ module.exports = { scrapeAll, scrapeCategory };
 
 //   console.log('\n\n🎉 All stores and categories complete!');
 //   console.log('Output saved in: output/<store>/<category>/');
+//   log('INFO', 'index.js', 'scrapeAll', `Run finished — ${results.filter(r => r.success).length}/${results.length} store/category runs succeeded`);
 
 //   return results;
 // }
@@ -453,6 +504,7 @@ module.exports = { scrapeAll, scrapeCategory };
 // if (require.main === module) {
 //   scrapeAll().catch(err => {
 //     console.error('Fatal error:', err.message);
+//     log('ERROR', 'index.js', 'scrapeAll', `Fatal error: ${err.message}`);
 //     process.exit(1);
 //   });
 // }
