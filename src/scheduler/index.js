@@ -42,6 +42,7 @@ require('dotenv').config();
 
 //
 const { v4: uuidv4 } = require('uuid');
+const { createLimiter } = require('../scraper/concurrency');
 const {
   loadInternalSkuSets,
   computeStatsForBatch,
@@ -437,6 +438,180 @@ function groupByStoreSlug(entries) {
 // ─────────────────────────────────────────────────────────────
 // MAIN SCHEDULER
 // ─────────────────────────────────────────────────────────────
+// async function runScheduler(options = {}) {
+//   const log         = options.log         || ((msg) => console.log(msg));
+//   const isCancelled = options.isCancelled || (() => false);
+
+//   const startTime = Date.now();
+//   log('⏰ Scheduler starting...');
+
+//   let pool;
+
+//   try {
+//     pool = await getSqlPool();
+//     log('🔌 Connected to SQL');
+
+//     // Load live scraper config from CategoryMappings (DB-driven)
+//     const scraperConfig = await loadScraperConfigFromDB(pool);
+//     log(`📋 Loaded ${scraperConfig.length} mapping rows from CategoryMappings`);
+
+//     if (scraperConfig.length === 0) {
+//       log('⚠️  No category mappings found in DB — nothing to scrape.');
+//       log('   Go to Settings → Category Mapping and link store categories to internal categories first.');
+//       return;
+//     }
+
+//     // Load schedule only for categories present in the live config
+//     const scheduleRows = await loadScrapingSchedule(pool, scraperConfig);
+
+//     // Build map: categoryName → schedule row
+//     const scheduleMap = new Map(scheduleRows.map(r => [r.Category, r]));
+
+//     // Determine due / skipped / paused
+//     const due     = [];
+//     const skipped = [];
+//     const paused  = [];
+
+//     for (const config of scraperConfig) {
+//       const schedule   = scheduleMap.get(config.categoryName);
+//       const isEnabled  = schedule ? (schedule.IsScrapEnabled !== false && schedule.IsScrapEnabled !== 0) : true;
+//       const freqDays   = schedule?.ScrapFreqDays ?? DEFAULT_FREQ_DAYS;
+//       const nextDue    = schedule?.NextScrapDueAt ?? null;
+
+//       if (!isEnabled) {
+//         paused.push({ ...config, freqDays });
+//         continue;
+//       }
+
+//       if (isDue(nextDue)) {
+//         due.push({ ...config, freqDays, nextDue });
+//       } else {
+//         skipped.push({ ...config, freqDays, nextDue });
+//       }
+//     }
+
+//     log(`✅ Due for scraping  : ${due.length} category mappings`);
+//     log(`⏭️  Not due yet       : ${skipped.length} category mappings`);
+
+//     if (paused.length > 0) {
+//       log(`⏸️  Paused (Settings) : ${paused.length} category mappings`);
+//       paused.forEach(r => log(`   → ${r.categoryName}`));
+//     }
+
+//     skipped.forEach(r =>
+//       log(`⏭️  Skipping ${r.categoryName} — next due: ${r.nextDue}`)
+//     );
+
+//     if (due.length === 0) {
+//       log('ℹ️  Nothing to scrape — all categories are up to date.');
+//       return;
+//     }
+
+//     // ── Group by storeName+slug so each store page is scraped
+//     // exactly once, even if it maps to several internal categories ──
+//     const dueGroups = groupByStoreSlug(due);
+//     log(`\n🚀 Starting scrapes for ${dueGroups.length} unique store pages (covering ${due.length} category mappings)...`);
+
+//     let totalScraped   = 0;
+//     let totalFailed    = 0;
+//     let totalPushed    = 0;
+//     let categoriesDone = 0;
+
+//     for (const group of dueGroups) {
+//       // Check cancel between groups — never mid-scrape
+//       if (isCancelled()) {
+//         log(`🛑 Cancellation requested — stopping after ${categoriesDone} category mappings.`);
+//         log(`   Remaining categories will be retried on next run.`);
+//         break;
+//       }
+
+//       // Resolve store + category objects from urls.js
+//       const resolved = resolveStoreConfig(group.storeName, group.slug);
+
+//       if (!resolved) {
+//         log(`⚠️  Config error: storeName="${group.storeName}" slug="${group.slug}" not found in urls.js`);
+//         log(`   Check the Category Mapping for: ${group.categoryNames.join(', ')}`);
+//         continue;
+//       }
+
+//       const { store, category } = resolved;
+
+//       // Use the freqDays from the first mapped category in this group
+//       // (they typically share the same frequency; if they differ,
+//       // the first one found wins — this matches prior single-category
+//       // behaviour closely enough for now).
+//       const freqDays = due.find(d => d.storeName === group.storeName && d.slug === group.slug)?.freqDays ?? DEFAULT_FREQ_DAYS;
+
+//       log(`━━━ ${store.name}/${category.slug} → maps to: ${group.categoryNames.join(', ')} (every ${freqDays}d) ━━━`);
+
+//       log(`   🗑️  Clearing stale cache...`);
+//       clearCategoryCache(store.name, category.slug);
+
+//       try {
+//         log(`   🌐 Scraping ${store.name}/${category.slug}...`);
+//         const result = await scrapeCategory(store, category);
+
+//         log(`   📦 Scraped: ${result.saved} products | Failed: ${result.failed}`);
+
+//         if (result.saved === 0) {
+//           // FIX 2: Do NOT update NextScrapDueAt on zero results.
+//           // Category stays due so it retries next run.
+//           log(`   ⚠️  0 products scraped — NextScrapDueAt NOT updated (will retry next run)`);
+//           totalFailed++;
+//           continue;
+//         }
+
+//         totalScraped += result.saved;
+
+//         // Push to Cosmos immediately after each scrape (crash-safe)
+//         if (result.products?.length > 0) {
+//           const { pushed } = await pushScrapedDataToCosmos(
+//             result.products,
+//             `${store.name}/${category.slug}`,
+//             log
+//           );
+//           totalPushed += pushed;
+//         }
+
+//         // FIX 2: Only stamp timestamps when we actually got products.
+//         // Stamp for EVERY internal category this store/slug maps to —
+//         // this is the "scrape once, count for all" many-to-many behaviour.
+//         for (const categoryName of group.categoryNames) {
+//           await updateScrapedTimestamps(pool, categoryName, freqDays);
+//         }
+//         log(`   ⏰ Next scrape in ${freqDays} days — stamped for: ${group.categoryNames.join(', ')}`);
+//         categoriesDone += group.categoryNames.length;
+
+//       } catch (err) {
+//         log(`   ❌ Scrape failed for ${store.name}/${category.slug}: ${err.message}`);
+//         totalFailed++;
+//         // No timestamp update on exception — these categories retry next run
+//       }
+//     }
+
+//     // Run cleanup mapper once at the end
+//     if (categoriesDone > 0) {
+//       log('\n📤 Running cleanup mapper (Cosmos → SQL CompetitorPrices)...');
+//       await runCleanupMapper(log);
+//     } else {
+//       log('\n⚠️  No categories completed — skipping cleanup mapper');
+//     }
+
+//     const totalSec = ((Date.now() - startTime) / 1000).toFixed(1);
+//     log(`\n🎉 Scheduler finished in ${totalSec}s`);
+//     log(`   Category mappings done : ${categoriesDone}`);
+//     log(`   Products scraped       : ${totalScraped}`);
+//     log(`   Cosmos pushed          : ${totalPushed}`);
+//     log(`   Failed/skipped         : ${totalFailed}`);
+
+//   } catch (err) {
+//     log(`❌ Scheduler fatal error: ${err.message}`);
+//     throw err;
+//   } finally {
+//     if (pool) await pool.close();
+//   }
+// }
+
 async function runScheduler(options = {}) {
   const log         = options.log         || ((msg) => console.log(msg));
   const isCancelled = options.isCancelled || (() => false);
@@ -450,7 +625,6 @@ async function runScheduler(options = {}) {
     pool = await getSqlPool();
     log('🔌 Connected to SQL');
 
-    // Load live scraper config from CategoryMappings (DB-driven)
     const scraperConfig = await loadScraperConfigFromDB(pool);
     log(`📋 Loaded ${scraperConfig.length} mapping rows from CategoryMappings`);
 
@@ -460,22 +634,18 @@ async function runScheduler(options = {}) {
       return;
     }
 
-    // Load schedule only for categories present in the live config
     const scheduleRows = await loadScrapingSchedule(pool, scraperConfig);
+    const scheduleMap  = new Map(scheduleRows.map(r => [r.Category, r]));
 
-    // Build map: categoryName → schedule row
-    const scheduleMap = new Map(scheduleRows.map(r => [r.Category, r]));
-
-    // Determine due / skipped / paused
     const due     = [];
     const skipped = [];
     const paused  = [];
 
     for (const config of scraperConfig) {
-      const schedule   = scheduleMap.get(config.categoryName);
-      const isEnabled  = schedule ? (schedule.IsScrapEnabled !== false && schedule.IsScrapEnabled !== 0) : true;
-      const freqDays   = schedule?.ScrapFreqDays ?? DEFAULT_FREQ_DAYS;
-      const nextDue    = schedule?.NextScrapDueAt ?? null;
+      const schedule  = scheduleMap.get(config.categoryName);
+      const isEnabled = schedule ? (schedule.IsScrapEnabled !== false && schedule.IsScrapEnabled !== 0) : true;
+      const freqDays  = schedule?.ScrapFreqDays ?? DEFAULT_FREQ_DAYS;
+      const nextDue   = schedule?.NextScrapDueAt ?? null;
 
       if (!isEnabled) {
         paused.push({ ...config, freqDays });
@@ -497,72 +667,66 @@ async function runScheduler(options = {}) {
       paused.forEach(r => log(`   → ${r.categoryName}`));
     }
 
-    skipped.forEach(r =>
-      log(`⏭️  Skipping ${r.categoryName} — next due: ${r.nextDue}`)
-    );
+    skipped.forEach(r => log(`⏭️  Skipping ${r.categoryName} — next due: ${r.nextDue}`));
 
     if (due.length === 0) {
       log('ℹ️  Nothing to scrape — all categories are up to date.');
       return;
     }
 
-    // ── Group by storeName+slug so each store page is scraped
-    // exactly once, even if it maps to several internal categories ──
     const dueGroups = groupByStoreSlug(due);
     log(`\n🚀 Starting scrapes for ${dueGroups.length} unique store pages (covering ${due.length} category mappings)...`);
+
+    const SCRAPE_CONCURRENCY = Number(process.env.SCRAPE_CONCURRENCY) || 8;
+    const limit = createLimiter(SCRAPE_CONCURRENCY); // ONE shared cap across every group below
+    log(`⚙️  Concurrency: ${SCRAPE_CONCURRENCY} parallel Bright Data requests (SCRAPE_CONCURRENCY env var)`);
 
     let totalScraped   = 0;
     let totalFailed    = 0;
     let totalPushed    = 0;
     let categoriesDone = 0;
 
-    for (const group of dueGroups) {
-      // Check cancel between groups — never mid-scrape
+    // Groups now run CONCURRENTLY — actual HTTP concurrency is still
+    // capped by the shared `limit` above, so this is safe. Cancellation
+    // check moved inside each group's task: groups not yet started when
+    // cancel fires are skipped, but any group already mid-scrape will
+    // finish (same "never cancel mid-scrape" intent, adapted for
+    // concurrent groups instead of one at a time).
+    await Promise.all(dueGroups.map(async (group) => {
       if (isCancelled()) {
-        log(`🛑 Cancellation requested — stopping after ${categoriesDone} category mappings.`);
-        log(`   Remaining categories will be retried on next run.`);
-        break;
+        log(`🛑 Cancellation requested — skipping ${group.storeName}/${group.slug} (will retry next run)`);
+        return;
       }
 
-      // Resolve store + category objects from urls.js
       const resolved = resolveStoreConfig(group.storeName, group.slug);
 
       if (!resolved) {
         log(`⚠️  Config error: storeName="${group.storeName}" slug="${group.slug}" not found in urls.js`);
         log(`   Check the Category Mapping for: ${group.categoryNames.join(', ')}`);
-        continue;
+        return;
       }
 
       const { store, category } = resolved;
-
-      // Use the freqDays from the first mapped category in this group
-      // (they typically share the same frequency; if they differ,
-      // the first one found wins — this matches prior single-category
-      // behaviour closely enough for now).
       const freqDays = due.find(d => d.storeName === group.storeName && d.slug === group.slug)?.freqDays ?? DEFAULT_FREQ_DAYS;
 
       log(`━━━ ${store.name}/${category.slug} → maps to: ${group.categoryNames.join(', ')} (every ${freqDays}d) ━━━`);
-
       log(`   🗑️  Clearing stale cache...`);
       clearCategoryCache(store.name, category.slug);
 
       try {
         log(`   🌐 Scraping ${store.name}/${category.slug}...`);
-        const result = await scrapeCategory(store, category);
+        const result = await scrapeCategory(store, category, isCancelled, limit);
 
         log(`   📦 Scraped: ${result.saved} products | Failed: ${result.failed}`);
 
         if (result.saved === 0) {
-          // FIX 2: Do NOT update NextScrapDueAt on zero results.
-          // Category stays due so it retries next run.
           log(`   ⚠️  0 products scraped — NextScrapDueAt NOT updated (will retry next run)`);
           totalFailed++;
-          continue;
+          return;
         }
 
         totalScraped += result.saved;
 
-        // Push to Cosmos immediately after each scrape (crash-safe)
         if (result.products?.length > 0) {
           const { pushed } = await pushScrapedDataToCosmos(
             result.products,
@@ -572,9 +736,6 @@ async function runScheduler(options = {}) {
           totalPushed += pushed;
         }
 
-        // FIX 2: Only stamp timestamps when we actually got products.
-        // Stamp for EVERY internal category this store/slug maps to —
-        // this is the "scrape once, count for all" many-to-many behaviour.
         for (const categoryName of group.categoryNames) {
           await updateScrapedTimestamps(pool, categoryName, freqDays);
         }
@@ -584,11 +745,9 @@ async function runScheduler(options = {}) {
       } catch (err) {
         log(`   ❌ Scrape failed for ${store.name}/${category.slug}: ${err.message}`);
         totalFailed++;
-        // No timestamp update on exception — these categories retry next run
       }
-    }
+    }));
 
-    // Run cleanup mapper once at the end
     if (categoriesDone > 0) {
       log('\n📤 Running cleanup mapper (Cosmos → SQL CompetitorPrices)...');
       await runCleanupMapper(log);
@@ -1072,6 +1231,15 @@ module.exports = {
 
 
 
+
+
+
+
+
+
+
+
+
 // // src/scheduler/index.js
 // // ─────────────────────────────────────────────────────────────
 // // PHASE 1 REWRITE — fixes:
@@ -1119,7 +1287,9 @@ module.exports = {
 // const {
 //   loadInternalSkuSets,
 //   computeStatsForBatch,
+//   collectMatchedSkuRows,
 //   saveRunStats,
+//   saveSkuMatchRows,
 // } = require('../services/scrapeStatsService');
 // //
 
@@ -1299,6 +1469,45 @@ module.exports = {
 //       requestTimeout       : 60_000,
 //     },
 //   });
+// }
+
+// // ── FIX: AAD access tokens expire after ~60-90 min. Long manual
+// // scraper runs (many categories, or one big one like 1338 products)
+// // regularly outlive that window, so a `pool` grabbed once at the
+// // start of the job goes stale before the diagnostics/stats writes
+// // at the end — surfacing as "Connection is closed".
+// //
+// // getHealthySqlPool() re-authenticates with a fresh AAD token
+// // whenever the current pool looks dead, and is safe to call as
+// // often as needed (cheap no-op when the pool is still alive).
+// // Callers should always reassign: pool = await getHealthySqlPool(pool);
+// async function getHealthySqlPool(existingPool) {
+//   if (existingPool && existingPool.connected) {
+//     return existingPool;
+//   }
+//   if (existingPool) {
+//     try { await existingPool.close(); } catch (_) { /* already dead, ignore */ }
+//   }
+//   return await getSqlPool();
+// }
+
+// // ── Runs a SQL operation with one automatic reconnect-and-retry
+// // if it fails with a stale/closed connection. Returns the (possibly
+// // new) pool alongside the result so the caller can keep using it.
+// async function withSqlRetry(pool, fn, { log = console.log, label = 'SQL operation' } = {}) {
+//   try {
+//     const result = await fn(pool);
+//     return { pool, result };
+//   } catch (err) {
+//     const isConnIssue = /closed|connection|ECONNRESET|ETIMEOUT|ESOCKET/i.test(err.message || '');
+//     if (!isConnIssue) throw err;
+
+//     log(`⚠️  ${label} failed (${err.message}) — reconnecting and retrying once...`);
+//     pool = await getHealthySqlPool(null); // force a brand-new pool + fresh token
+//     const result = await fn(pool);
+//     log(`✅ ${label} succeeded after reconnect`);
+//     return { pool, result };
+//   }
 // }
 
 // // ── Load schedule only for categories we actually scrape ──────
@@ -1719,6 +1928,7 @@ module.exports = {
 //   let totalPushed = 0;
 //   let totalFailed = 0;
 //   const statsRows = [];
+//   const skuMatchRows = []; // matched SKUs only, across the whole run — saved to ScrapeRunSkuMatches for CSV export
 
 //   log('Manual scraper starting...');
 
@@ -1795,6 +2005,14 @@ module.exports = {
 //         });
 //         log(`Matched (strict/simple): ${stats.MatchedStrict}/${stats.MatchedSimple} | No SKU: ${stats.NullOrEmptySku} | No internal match: ${stats.SkuNoInternalMatch}`);
 
+//         // ── CSV export rows: matched SKUs only (Recommendation/Basic Match) ──
+//         const matchedRows = collectMatchedSkuRows(result.products || [], skuSets, {
+//           runId, runStartedAt,
+//           storeName: store.name, storeSlug: category.slug,
+//           categoryNames: group.categoryNames,
+//         });
+//         skuMatchRows.push(...matchedRows);
+
 //         if (result.saved === 0) {
 //           log('0 products scraped - scheduler dates not updated.');
 //           totalFailed++;
@@ -1813,8 +2031,17 @@ module.exports = {
 //           totalPushed += pushed;
 //         }
 
+//         // FIX: re-check pool health before every SQL write in the loop —
+//         // a category that scrapes slowly (many products) can push us past
+//         // the AAD token's ~60-90 min lifetime mid-job, well before we ever
+//         // reach the final diagnostics save.
+//         pool = await getHealthySqlPool(pool);
 //         for (const categoryName of group.categoryNames) {
-//           await updateManualScrapedAt(pool, categoryName);
+//           ({ pool } = await withSqlRetry(
+//             pool,
+//             (p) => updateManualScrapedAt(p, categoryName),
+//             { log, label: `updateManualScrapedAt(${categoryName})` }
+//           ));
 //         }
 //         log(`LastScrapedAt updated for: ${group.categoryNames.join(', ')}`);
 
@@ -1832,15 +2059,68 @@ module.exports = {
 //       }
 //     }
 
+//     // FIX: refresh the pool one more time before the final writes — by
+//     // this point the job may have run long enough for the AAD token
+//     // fetched at the very start to have expired. withSqlRetry() also
+//     // covers the case where it dies mid-write. Neither of these two
+//     // blocks is allowed to throw: a diagnostics-write failure must NOT
+//     // overwrite an otherwise-successful scrape+Cosmos-push run with a
+//     // "Fatal error" — see FIX note on jobsDone check below.
+//     let diagnosticsSaved = false;
 //     if (statsRows.length > 0) {
 //       log('Saving scrape diagnostics...');
-//       await saveRunStats(pool, statsRows);
-//       log(`Saved diagnostics for ${statsRows.length} store/category batches (RunId=${runId})`);
+//       try {
+//         pool = await getHealthySqlPool(pool);
+//         ({ pool } = await withSqlRetry(
+//           pool,
+//           (p) => saveRunStats(p, statsRows),
+//           { log, label: 'saveRunStats' }
+//         ));
+//         log(`Saved diagnostics for ${statsRows.length} store/category batches (RunId=${runId})`);
+//         diagnosticsSaved = true;
+//       } catch (err) {
+//         log(`❌ Diagnostics save failed even after reconnect: ${err.message}`);
+//         log(`⚠️  Scrape + Cosmos push for this run were NOT lost — only the`);
+//         log(`   Scrape Stats page row is missing. RunId=${runId} needs a manual backfill.`);
+//       }
+//     }
+
+//     // ── Persist matched-SKU rows for the CSV export ──────────────────
+//     let skuMatchesSaved = false;
+//     if (skuMatchRows.length > 0) {
+//       log('Saving matched-SKU rows for CSV export...');
+//       try {
+//         pool = await getHealthySqlPool(pool);
+//         ({ pool } = await withSqlRetry(
+//           pool,
+//           (p) => saveSkuMatchRows(p, skuMatchRows),
+//           { log, label: 'saveSkuMatchRows' }
+//         ));
+//         log(`Saved ${skuMatchRows.length} matched SKUs (RunId=${runId})`);
+//         skuMatchesSaved = true;
+//       } catch (err) {
+//         log(`❌ SKU match rows save failed even after reconnect: ${err.message}`);
+//         log(`   RunId=${runId} needs a manual backfill for ScrapeRunSkuMatches too.`);
+//       }
+//     }
+
+//     if (!diagnosticsSaved || !skuMatchesSaved) {
+//       log(`⚠️  Diagnostics incomplete for RunId=${runId} — Scrape Stats page will not show this run until backfilled.`);
 //     }
 
 //     if (jobsDone > 0) {
 //       log('Running cleanup mapper...');
-//       await runCleanupMapper(log);
+//       try {
+//         await runCleanupMapper(log);
+//       } catch (err) {
+//         // FIX: cleanup mapper (Cosmos -> CompetitorPrices) is also a
+//         // long-ish DB operation and was previously unguarded — a failure
+//         // here used to throw all the way out and get logged as the job's
+//         // "Fatal error", even though scraping/Cosmos/diagnostics above
+//         // may all have already succeeded.
+//         log(`❌ Cleanup mapper failed: ${err.message}`);
+//         log(`   CompetitorPrices may be stale for this run — rerun cleanup_mapper.js manually if needed.`);
+//       }
 //     } else {
 //       log('No jobs completed - skipping cleanup mapper.');
 //     }
