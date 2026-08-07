@@ -1,75 +1,53 @@
 // src/scraper/index.js
 //
-// CHANGE:
-//   scrapeCategory() now returns { done, saved, failed, products[], cancelled }
-//   The products array contains all successfully scraped product objects
-//   in memory so the scheduler can push them directly to Cosmos without
-//   reading back from disk. Disk writes (output/ folder) still happen
-//   as a backup/log but are NOT relied upon for the automated flow.
+// CHANGE (parallel scraping, 2026-08-05):
+//   Products inside a category now scrape CONCURRENTLY (shared limiter,
+//   SCRAPE_CONCURRENCY env var, default 5) instead of serially with a
+//   1.5s sleep between each. Listing-page pagination is still serial
+//   (has to follow "next page" links in order) but now also goes
+//   through the same limiter so it counts against the same cap.
+//   rebuildPriceFile() + visitedCache write now happen once at the end
+//   of a category instead of after every product.
 //
-//   Manual runs (node src/scraper/index.js) are completely unchanged.
+// CHANGE (Ctrl+C handling):
+//   scrapeAll() accepts isCancelled() and threads it through to every
+//   category. The CLI block at the bottom registers SIGINT/SIGTERM so
+//   `node src/scraper/index.js` stops cleanly on Ctrl+C — only runs for
+//   direct CLI runs, never in production (scheduler/API require() this
+//   file as a module, so this block never executes there).
 //
-// FIX 1 (2026-06-13): Cache bugs — see details below.
-//
-// FIX 2 (2026-06-13): Cancel now stops IMMEDIATELY between products,
-//   not just between categories. isCancelled() is now accepted as an
-//   optional parameter and checked inside the product scraping loop.
-//   When cancel is requested mid-category, the function returns early
-//   with whatever products were already scraped, and sets cancelled=true
-//   in the return value so the caller knows to stop.
-//
-// FIX 3 (2026-08-04): Duplicate-URL dedup for stores (e.g. Shopify —
-//   confirmed on vishal) that link to the SAME product page via two
-//   different URL forms — e.g. a bare "/products/<handle>" link
-//   (wishlist/quick-view/related-widget) AND a collection-scoped
-//   "/collections/<slug>/products/<handle>" link (main grid) on the
-//   same crawled pages. Both are valid URLs for the identical page,
-//   but as plain strings they're different, so a Set alone doesn't
-//   catch the duplicate — this doubled vishal's Power Supply scrape
-//   count (165 real products -> ~330 scraped). Fixed by deduping on a
-//   canonical form (collection segment stripped) while still keeping
-//   whichever original URL form was first discovered for the actual
-//   scrape, so per-parser category-from-URL logic (e.g. vishal.js)
-//   keeps working unchanged.
+// CHANGE (this update): scrapeAll() now times the whole run and prints
+//   total elapsed minutes when it finishes.
 // ─────────────────────────────────────────────────────────────
 
 require('dotenv').config();
 
-const { fetchPage }                                        = require('./fetchPage');
-const { ensureDir, readJson, writeJson, getPaths }         = require('./fileHelpers');
-const { scrapeAndSave }                                    = require('./scrapeProduct');
-const { STORES }                                           = require('../urls');
-const { log }                                              = require('../../blobLogger');
+const { fetchPage }                                                  = require('./fetchPage');
+const { ensureDir, readJson, writeJson, getPaths, rebuildPriceFile } = require('./fileHelpers');
+const { scrapeAndSave }                                              = require('./scrapeProduct');
+const { createLimiter }                                              = require('./concurrency');
+const { createMutex }                                                = require('./mutex');
+const { STORES }                                                     = require('../urls');
+const { log }                                                        = require('../../blobLogger');
 
-// ─────────────────────────────────────────────────────────────
-//  URL COLLECTION
-// ─────────────────────────────────────────────────────────────
+const DEFAULT_CONCURRENCY = Number(process.env.SCRAPE_CONCURRENCY) || 5;
 
-// FIX 3: strips an optional "/collections/<slug>" segment immediately
-// before "/products/" so two links pointing at the same product page
-// via different URL forms collapse to the same canonical key.
-// "https://x.com/collections/power-supply/products/foo" and
-// "https://x.com/products/foo" both canonicalize to
-// "https://x.com/products/foo".
 function canonicalizeProductUrl(url) {
   if (!url) return url;
   return url.replace(/\/collections\/[^/]+(?=\/products\/)/i, '');
 }
 
-async function collectUrlsForCategory(store, startUrl, urlsCachePath) {
+async function collectUrlsForCategory(store, startUrl, urlsCachePath, limit) {
   const saved = readJson(urlsCachePath, null);
 
-  // FIX: `if (saved)` was truthy for an empty array [].
-  // A previous run that got 0 links would write [], and every run after
-  // that would load it and return 0 URLs. Only use cache if it has URLs.
   if (saved && saved.length > 0) {
     console.log(`  ♻️  Loaded ${saved.length} cached URLs`);
     return new Set(saved);
   }
 
   const { parser }         = store;
-  const productUrls        = new Set(); // URLs we'll actually scrape (original form kept)
-  const seenCanonicalUrls  = new Set(); // dedup key set (collection segment stripped) — FIX 3
+  const productUrls        = new Set();
+  const seenCanonicalUrls  = new Set();
   const visitedListingUrls = new Set();
   let currentUrl = startUrl;
   let pageNum    = 1;
@@ -86,13 +64,10 @@ async function collectUrlsForCategory(store, startUrl, urlsCachePath) {
     console.log(`  📄 Page ${pageNum}: ${currentUrl}`);
 
     try {
-      const html  = await fetchPage(currentUrl);
+      const html  = await limit(() => fetchPage(currentUrl));
       const links = parser.parseProductLinks(html);
       console.log(`     ↳ ${links.length} links found`);
 
-      // FIX 3: dedup on canonical form, but keep the first-seen original
-      // URL for scraping — preserves any collection-slug info a parser's
-      // category-from-URL logic (e.g. vishal.js) depends on.
       links.forEach(l => {
         const canonical = canonicalizeProductUrl(l);
         if (seenCanonicalUrls.has(canonical)) {
@@ -119,9 +94,6 @@ async function collectUrlsForCategory(store, startUrl, urlsCachePath) {
     log('INFO', 'index.js', 'collectUrlsForCategory', `Skipped ${dupesSkipped} duplicate-URL-form links for ${startUrl}`);
   }
 
-  // FIX: Never write an empty cache file.
-  // If Bright Data returned a challenge/empty page, writing [] would
-  // poison the cache permanently. Only write when we actually found URLs.
   if (productUrls.size > 0) {
     writeJson(urlsCachePath, [...productUrls]);
     console.log(`  💾 Saved ${productUrls.size} URLs to cache`);
@@ -133,23 +105,13 @@ async function collectUrlsForCategory(store, startUrl, urlsCachePath) {
   return productUrls;
 }
 
-// ─────────────────────────────────────────────────────────────
-//  CATEGORY RUNNER
-// ─────────────────────────────────────────────────────────────
-
 /**
- * Scrapes all products for a single store + category.
- *
- * @param {object} store
- * @param {object} category
- * @param {function} [isCancelled] - Optional. Called before each product.
- *   If it returns true, scraping stops immediately and the function
- *   returns early with cancelled=true. Defaults to () => false.
- *
- * @returns {Promise<{ done, saved, failed, products[], cancelled }>}
- *   cancelled=true means scraping was cut short by the cancel flag.
+ * @param {function} [limit] - shared limiter from createLimiter(). If not
+ *   passed, this category gets its own (fine for a one-off manual run) —
+ *   but the scheduler always passes ONE SHARED limiter so total
+ *   concurrency across categories stays capped.
  */
-async function scrapeCategory(store, category, isCancelled = () => false) {
+async function scrapeCategory(store, category, isCancelled = () => false, limit = createLimiter(DEFAULT_CONCURRENCY)) {
   const { name: storeName }    = store;
   const { slug, url: startUrl } = category;
 
@@ -161,104 +123,133 @@ async function scrapeCategory(store, category, isCancelled = () => false) {
   const paths = getPaths(storeName, slug);
   ensureDir(paths.dir);
 
-  const productUrls = await collectUrlsForCategory(store, startUrl, paths.urlsCache);
+  const productUrls = await collectUrlsForCategory(store, startUrl, paths.urlsCache, limit);
   console.log(`  ✅ ${productUrls.size} product URLs total`);
 
-  const visited   = new Set(readJson(paths.visitedCache, []));
-  const total     = productUrls.size;
-  let done        = visited.size;
-  let saved       = 0;
-  let failed      = 0;
-  let cancelled   = false;
-  const products  = [];
+  const visited = new Set(readJson(paths.visitedCache, []));
+  const total   = productUrls.size;
+  let doneCount = visited.size;
+  let saved     = 0;
+  let failed    = 0;
+  let cancelled = false;
 
   if (visited.size > 0) {
     console.log(`  ♻️  Resuming: ${visited.size} already done, ${total - visited.size} remaining`);
   }
 
-  for (const productUrl of productUrls) {
-    if (visited.has(productUrl)) continue;
+  const remaining = [...productUrls].filter(url => !visited.has(url));
+  const fileMutex = createMutex(); // serializes products_full.json writes for THIS category
 
-    // FIX 2: Check cancel flag before every single product, not just
-    // between categories. This gives near-immediate stop on cancel.
+  const tasks = remaining.map(productUrl => limit(async () => {
     if (isCancelled()) {
-      console.log(`  🛑 Cancel requested — stopping after ${saved} products scraped in this category`);
-      log('WARN', 'index.js', 'scrapeCategory', `Cancel requested — stopped after ${saved} products in ${storeName}/${slug}`);
       cancelled = true;
-      break;
+      return null;
     }
 
-    done++;
+    const product = await scrapeAndSave(store, productUrl, paths.fullOutput, paths.priceOutput, fileMutex);
 
-    process.stdout.write(`  🛒 [${done}/${total}] `);
-
-    const product = await scrapeAndSave(store, productUrl, paths.fullOutput, paths.priceOutput);
-
+    doneCount++;
     if (product?.name) {
-      console.log(`✅ ${product.name.substring(0, 55)}`);
+      console.log(`  🛒 [${doneCount}/${total}] ✅ ${product.name.substring(0, 55)}`);
       saved++;
-      products.push(product);
     } else {
-      console.log(`⚠️  No data — ${productUrl}`);
+      console.log(`  🛒 [${doneCount}/${total}] ⚠️  No data — ${productUrl}`);
       failed++;
     }
 
     visited.add(productUrl);
-    writeJson(paths.visitedCache, [...visited]);
+    return product;
+  }));
 
-    await new Promise(r => setTimeout(r, 1500));
+  const results  = await Promise.all(tasks);
+  const products = results.filter(p => p?.name);
+
+  writeJson(paths.visitedCache, [...visited]);
+  if (products.length > 0) {
+    rebuildPriceFile(paths.fullOutput, paths.priceOutput);
   }
 
   console.log(`\n  🏁 ${storeName}/${slug} complete${cancelled ? ' (cancelled)' : ''}`);
-  console.log(`     Saved : ${saved} | Failed: ${failed} | Total: ${done}`);
+  console.log(`     Saved : ${saved} | Failed: ${failed} | Total: ${doneCount}`);
   console.log(`     Full  → ${paths.fullOutput}`);
   console.log(`     Price → ${paths.priceOutput}`);
   log('INFO', 'index.js', 'scrapeCategory',
-    `${storeName}/${slug} complete${cancelled ? ' (cancelled)' : ''} — Saved: ${saved}, Failed: ${failed}, Total: ${done}`);
+    `${storeName}/${slug} complete${cancelled ? ' (cancelled)' : ''} — Saved: ${saved}, Failed: ${failed}, Total: ${doneCount}`);
 
-  return { done, saved, failed, products, cancelled };
+  return { done: doneCount, saved, failed, products, cancelled };
 }
 
-// ─────────────────────────────────────────────────────────────
-//  MAIN — runs all stores/categories when called directly
-// ─────────────────────────────────────────────────────────────
+async function scrapeAll(stores = STORES, isCancelled = () => false) {
+  const startTime = Date.now();
 
-async function scrapeAll(stores = STORES) {
   console.log('🚀 Multi-store price scraper (Web Unlocker API)\n');
   console.log(`   Stores     : ${stores.map(s => s.name).join(', ')}`);
 
   const totalCategories = stores.reduce((acc, s) => acc + s.categories.length, 0);
-  console.log(`   Categories : ${totalCategories}\n`);
-  log('INFO', 'index.js', 'scrapeAll', `Run started — stores: ${stores.map(s => s.name).join(', ')}, total categories: ${totalCategories}`);
+  console.log(`   Categories : ${totalCategories}`);
+  console.log(`   Concurrency: ${DEFAULT_CONCURRENCY} (SCRAPE_CONCURRENCY env var)\n`);
+  log('INFO', 'index.js', 'scrapeAll', `Run started — categories: ${totalCategories}, concurrency: ${DEFAULT_CONCURRENCY}`);
 
-  const results = [];
+  const limit = createLimiter(DEFAULT_CONCURRENCY); // ONE shared limiter for the whole run
 
+  const jobs = [];
   for (const store of stores) {
-    for (const category of store.categories) {
-      try {
-        const result = await scrapeCategory(store, category);
-        results.push({ store: store.name, category: category.slug, ...result, success: true });
-      } catch (err) {
-        console.error(`\n❌ Failed: ${store.name}/${category.slug}: ${err.message}`);
-        log('ERROR', 'index.js', 'scrapeAll', `Failed: ${store.name}/${category.slug}: ${err.message}`);
-        results.push({ store: store.name, category: category.slug, success: false, error: err.message });
-      }
-    }
+    for (const category of store.categories) jobs.push({ store, category });
   }
 
+  const results = await Promise.all(jobs.map(async ({ store, category }) => {
+    try {
+      const result = await scrapeCategory(store, category, isCancelled, limit);
+      return { store: store.name, category: category.slug, ...result, success: true };
+    } catch (err) {
+      console.error(`\n❌ Failed: ${store.name}/${category.slug}: ${err.message}`);
+      log('ERROR', 'index.js', 'scrapeAll', `Failed: ${store.name}/${category.slug}: ${err.message}`);
+      return { store: store.name, category: category.slug, success: false, error: err.message };
+    }
+  }));
+
+  const elapsedMs  = Date.now() - startTime;
+  const elapsedMin = (elapsedMs / 60000).toFixed(1);
+
   console.log('\n\n🎉 All stores and categories complete!');
-  console.log('Output saved in: output/<store>/<category>/');
-  log('INFO', 'index.js', 'scrapeAll', `Run finished — ${results.filter(r => r.success).length}/${results.length} store/category runs succeeded`);
+  console.log(`⏱️  Total time: ${elapsedMin} minutes`);
+  log('INFO', 'index.js', 'scrapeAll', `Run finished in ${elapsedMin} min — ${results.filter(r => r.success).length}/${results.length} succeeded`);
 
   return results;
 }
 
 if (require.main === module) {
-  scrapeAll().catch(err => {
-    console.error('Fatal error:', err.message);
-    log('ERROR', 'index.js', 'scrapeAll', `Fatal error: ${err.message}`);
-    process.exit(1);
-  });
+  let cliCancelled = false;
+  let forceExitTimer = null;
+
+  function requestShutdown(signal) {
+    if (cliCancelled) {
+      console.log('\n⚠️  Second interrupt — force exiting now. Current file writes may be incomplete.');
+      process.exit(1);
+    }
+    cliCancelled = true;
+    console.log(`\n🛑 ${signal} received — finishing in-flight requests (up to ${DEFAULT_CONCURRENCY}), then stopping. Press Ctrl+C again to force quit.`);
+
+    forceExitTimer = setTimeout(() => {
+      console.log('⏱️  Still not done after 15s — force exiting.');
+      process.exit(1);
+    }, 15_000);
+    forceExitTimer.unref(); // don't let this timer itself keep the process alive
+  }
+
+  process.on('SIGINT',  () => requestShutdown('SIGINT'));
+  process.on('SIGTERM', () => requestShutdown('SIGTERM'));
+
+  scrapeAll(STORES, () => cliCancelled)
+    .then(() => {
+      if (forceExitTimer) clearTimeout(forceExitTimer);
+      process.exit(cliCancelled ? 1 : 0);
+    })
+    .catch(err => {
+      console.error('Fatal error:', err.message);
+      log('ERROR', 'index.js', 'scrapeAll', `Fatal error: ${err.message}`);
+      process.exit(1);
+    });
 }
 
 module.exports = { scrapeAll, scrapeCategory };
@@ -290,45 +281,42 @@ module.exports = { scrapeAll, scrapeCategory };
 
 
 
+
+
+
+
 // // src/scraper/index.js
 // //
-// // CHANGE:
-// //   scrapeCategory() now returns { done, saved, failed, products[], cancelled }
-// //   The products array contains all successfully scraped product objects
-// //   in memory so the scheduler can push them directly to Cosmos without
-// //   reading back from disk. Disk writes (output/ folder) still happen
-// //   as a backup/log but are NOT relied upon for the automated flow.
-// //
-// //   Manual runs (node src/scraper/index.js) are completely unchanged.
-// //
-// // FIX 1 (2026-06-13): Cache bugs — see details below.
-// //
-// // FIX 2 (2026-06-13): Cancel now stops IMMEDIATELY between products,
-// //   not just between categories. isCancelled() is now accepted as an
-// //   optional parameter and checked inside the product scraping loop.
-// //   When cancel is requested mid-category, the function returns early
-// //   with whatever products were already scraped, and sets cancelled=true
-// //   in the return value so the caller knows to stop.
+// // CHANGE (parallel scraping, 2026-08-05):
+// //   Products inside a category now scrape CONCURRENTLY (shared limiter,
+// //   SCRAPE_CONCURRENCY env var, default 8) instead of serially with a
+// //   1.5s sleep between each. Listing-page pagination is still serial
+// //   (has to follow "next page" links in order) but now also goes
+// //   through the same limiter so it counts against the same cap.
+// //   rebuildPriceFile() + visitedCache write now happen once at the end
+// //   of a category instead of after every product.
 // // ─────────────────────────────────────────────────────────────
 
 // require('dotenv').config();
 
-// const { fetchPage }                                        = require('./fetchPage');
-// const { ensureDir, readJson, writeJson, getPaths }         = require('./fileHelpers');
-// const { scrapeAndSave }                                    = require('./scrapeProduct');
-// const { STORES }                                           = require('../urls');
-// const { log }                                              = require('../../blobLogger');
+// const { fetchPage }                                                  = require('./fetchPage');
+// const { ensureDir, readJson, writeJson, getPaths, rebuildPriceFile } = require('./fileHelpers');
+// const { scrapeAndSave }                                              = require('./scrapeProduct');
+// const { createLimiter }                                              = require('./concurrency');
+// const { createMutex }                                                = require('./mutex');
+// const { STORES }                                                     = require('../urls');
+// const { log }                                                        = require('../../blobLogger');
 
-// // ─────────────────────────────────────────────────────────────
-// //  URL COLLECTION
-// // ─────────────────────────────────────────────────────────────
+// const DEFAULT_CONCURRENCY = Number(process.env.SCRAPE_CONCURRENCY) || 5;
 
-// async function collectUrlsForCategory(store, startUrl, urlsCachePath) {
+// function canonicalizeProductUrl(url) {
+//   if (!url) return url;
+//   return url.replace(/\/collections\/[^/]+(?=\/products\/)/i, '');
+// }
+
+// async function collectUrlsForCategory(store, startUrl, urlsCachePath, limit) {
 //   const saved = readJson(urlsCachePath, null);
 
-//   // FIX: `if (saved)` was truthy for an empty array [].
-//   // A previous run that got 0 links would write [], and every run after
-//   // that would load it and return 0 URLs. Only use cache if it has URLs.
 //   if (saved && saved.length > 0) {
 //     console.log(`  ♻️  Loaded ${saved.length} cached URLs`);
 //     return new Set(saved);
@@ -336,9 +324,11 @@ module.exports = { scrapeAll, scrapeCategory };
 
 //   const { parser }         = store;
 //   const productUrls        = new Set();
+//   const seenCanonicalUrls  = new Set();
 //   const visitedListingUrls = new Set();
 //   let currentUrl = startUrl;
 //   let pageNum    = 1;
+//   let dupesSkipped = 0;
 
 //   while (currentUrl) {
 //     if (visitedListingUrls.has(currentUrl)) {
@@ -351,10 +341,19 @@ module.exports = { scrapeAll, scrapeCategory };
 //     console.log(`  📄 Page ${pageNum}: ${currentUrl}`);
 
 //     try {
-//       const html  = await fetchPage(currentUrl);
+//       const html  = await limit(() => fetchPage(currentUrl));
 //       const links = parser.parseProductLinks(html);
 //       console.log(`     ↳ ${links.length} links found`);
-//       links.forEach(l => productUrls.add(l));
+
+//       links.forEach(l => {
+//         const canonical = canonicalizeProductUrl(l);
+//         if (seenCanonicalUrls.has(canonical)) {
+//           dupesSkipped++;
+//           return;
+//         }
+//         seenCanonicalUrls.add(canonical);
+//         productUrls.add(l);
+//       });
 
 //       currentUrl = parser.getNextPageUrl(html, currentUrl);
 //       pageNum++;
@@ -367,9 +366,11 @@ module.exports = { scrapeAll, scrapeCategory };
 //     await new Promise(r => setTimeout(r, 1500));
 //   }
 
-//   // FIX: Never write an empty cache file.
-//   // If Bright Data returned a challenge/empty page, writing [] would
-//   // poison the cache permanently. Only write when we actually found URLs.
+//   if (dupesSkipped > 0) {
+//     console.log(`  🧹 Skipped ${dupesSkipped} duplicate-URL-form links (same product, different link form)`);
+//     log('INFO', 'index.js', 'collectUrlsForCategory', `Skipped ${dupesSkipped} duplicate-URL-form links for ${startUrl}`);
+//   }
+
 //   if (productUrls.size > 0) {
 //     writeJson(urlsCachePath, [...productUrls]);
 //     console.log(`  💾 Saved ${productUrls.size} URLs to cache`);
@@ -381,23 +382,13 @@ module.exports = { scrapeAll, scrapeCategory };
 //   return productUrls;
 // }
 
-// // ─────────────────────────────────────────────────────────────
-// //  CATEGORY RUNNER
-// // ─────────────────────────────────────────────────────────────
-
 // /**
-//  * Scrapes all products for a single store + category.
-//  *
-//  * @param {object} store
-//  * @param {object} category
-//  * @param {function} [isCancelled] - Optional. Called before each product.
-//  *   If it returns true, scraping stops immediately and the function
-//  *   returns early with cancelled=true. Defaults to () => false.
-//  *
-//  * @returns {Promise<{ done, saved, failed, products[], cancelled }>}
-//  *   cancelled=true means scraping was cut short by the cancel flag.
+//  * @param {function} [limit] - shared limiter from createLimiter(). If not
+//  *   passed, this category gets its own (fine for a one-off manual run) —
+//  *   but the scheduler always passes ONE SHARED limiter so total
+//  *   concurrency across categories stays capped.
 //  */
-// async function scrapeCategory(store, category, isCancelled = () => false) {
+// async function scrapeCategory(store, category, isCancelled = () => false, limit = createLimiter(DEFAULT_CONCURRENCY)) {
 //   const { name: storeName }    = store;
 //   const { slug, url: startUrl } = category;
 
@@ -409,95 +400,91 @@ module.exports = { scrapeAll, scrapeCategory };
 //   const paths = getPaths(storeName, slug);
 //   ensureDir(paths.dir);
 
-//   const productUrls = await collectUrlsForCategory(store, startUrl, paths.urlsCache);
+//   const productUrls = await collectUrlsForCategory(store, startUrl, paths.urlsCache, limit);
 //   console.log(`  ✅ ${productUrls.size} product URLs total`);
 
-//   const visited   = new Set(readJson(paths.visitedCache, []));
-//   const total     = productUrls.size;
-//   let done        = visited.size;
-//   let saved       = 0;
-//   let failed      = 0;
-//   let cancelled   = false;
-//   const products  = [];
+//   const visited = new Set(readJson(paths.visitedCache, []));
+//   const total   = productUrls.size;
+//   let doneCount = visited.size;
+//   let saved     = 0;
+//   let failed    = 0;
+//   let cancelled = false;
 
 //   if (visited.size > 0) {
 //     console.log(`  ♻️  Resuming: ${visited.size} already done, ${total - visited.size} remaining`);
 //   }
 
-//   for (const productUrl of productUrls) {
-//     if (visited.has(productUrl)) continue;
+//   const remaining = [...productUrls].filter(url => !visited.has(url));
+//   const fileMutex = createMutex(); // serializes products_full.json writes for THIS category
 
-//     // FIX 2: Check cancel flag before every single product, not just
-//     // between categories. This gives near-immediate stop on cancel.
+//   const tasks = remaining.map(productUrl => limit(async () => {
 //     if (isCancelled()) {
-//       console.log(`  🛑 Cancel requested — stopping after ${saved} products scraped in this category`);
-//       log('WARN', 'index.js', 'scrapeCategory', `Cancel requested — stopped after ${saved} products in ${storeName}/${slug}`);
 //       cancelled = true;
-//       break;
+//       return null;
 //     }
 
-//     done++;
+//     const product = await scrapeAndSave(store, productUrl, paths.fullOutput, paths.priceOutput, fileMutex);
 
-//     process.stdout.write(`  🛒 [${done}/${total}] `);
-
-//     const product = await scrapeAndSave(store, productUrl, paths.fullOutput, paths.priceOutput);
-
+//     doneCount++;
 //     if (product?.name) {
-//       console.log(`✅ ${product.name.substring(0, 55)}`);
+//       console.log(`  🛒 [${doneCount}/${total}] ✅ ${product.name.substring(0, 55)}`);
 //       saved++;
-//       products.push(product);
 //     } else {
-//       console.log(`⚠️  No data — ${productUrl}`);
+//       console.log(`  🛒 [${doneCount}/${total}] ⚠️  No data — ${productUrl}`);
 //       failed++;
 //     }
 
 //     visited.add(productUrl);
-//     writeJson(paths.visitedCache, [...visited]);
+//     return product;
+//   }));
 
-//     await new Promise(r => setTimeout(r, 1500));
+//   const results  = await Promise.all(tasks);
+//   const products = results.filter(p => p?.name);
+
+//   writeJson(paths.visitedCache, [...visited]);
+//   if (products.length > 0) {
+//     rebuildPriceFile(paths.fullOutput, paths.priceOutput);
 //   }
 
 //   console.log(`\n  🏁 ${storeName}/${slug} complete${cancelled ? ' (cancelled)' : ''}`);
-//   console.log(`     Saved : ${saved} | Failed: ${failed} | Total: ${done}`);
+//   console.log(`     Saved : ${saved} | Failed: ${failed} | Total: ${doneCount}`);
 //   console.log(`     Full  → ${paths.fullOutput}`);
 //   console.log(`     Price → ${paths.priceOutput}`);
 //   log('INFO', 'index.js', 'scrapeCategory',
-//     `${storeName}/${slug} complete${cancelled ? ' (cancelled)' : ''} — Saved: ${saved}, Failed: ${failed}, Total: ${done}`);
+//     `${storeName}/${slug} complete${cancelled ? ' (cancelled)' : ''} — Saved: ${saved}, Failed: ${failed}, Total: ${doneCount}`);
 
-//   return { done, saved, failed, products, cancelled };
+//   return { done: doneCount, saved, failed, products, cancelled };
 // }
-
-// // ─────────────────────────────────────────────────────────────
-// //  MAIN — runs all stores/categories when called directly
-// // ─────────────────────────────────────────────────────────────
 
 // async function scrapeAll(stores = STORES) {
 //   console.log('🚀 Multi-store price scraper (Web Unlocker API)\n');
 //   console.log(`   Stores     : ${stores.map(s => s.name).join(', ')}`);
 
 //   const totalCategories = stores.reduce((acc, s) => acc + s.categories.length, 0);
-//   console.log(`   Categories : ${totalCategories}\n`);
-//   log('INFO', 'index.js', 'scrapeAll', `Run started — stores: ${stores.map(s => s.name).join(', ')}, total categories: ${totalCategories}`);
+//   console.log(`   Categories : ${totalCategories}`);
+//   console.log(`   Concurrency: ${DEFAULT_CONCURRENCY} (SCRAPE_CONCURRENCY env var)\n`);
+//   log('INFO', 'index.js', 'scrapeAll', `Run started — categories: ${totalCategories}, concurrency: ${DEFAULT_CONCURRENCY}`);
 
-//   const results = [];
+//   const limit = createLimiter(DEFAULT_CONCURRENCY); // ONE shared limiter for the whole run
 
+//   const jobs = [];
 //   for (const store of stores) {
-//     for (const category of store.categories) {
-//       try {
-//         const result = await scrapeCategory(store, category);
-//         results.push({ store: store.name, category: category.slug, ...result, success: true });
-//       } catch (err) {
-//         console.error(`\n❌ Failed: ${store.name}/${category.slug}: ${err.message}`);
-//         log('ERROR', 'index.js', 'scrapeAll', `Failed: ${store.name}/${category.slug}: ${err.message}`);
-//         results.push({ store: store.name, category: category.slug, success: false, error: err.message });
-//       }
-//     }
+//     for (const category of store.categories) jobs.push({ store, category });
 //   }
 
-//   console.log('\n\n🎉 All stores and categories complete!');
-//   console.log('Output saved in: output/<store>/<category>/');
-//   log('INFO', 'index.js', 'scrapeAll', `Run finished — ${results.filter(r => r.success).length}/${results.length} store/category runs succeeded`);
+//   const results = await Promise.all(jobs.map(async ({ store, category }) => {
+//     try {
+//       const result = await scrapeCategory(store, category, () => false, limit);
+//       return { store: store.name, category: category.slug, ...result, success: true };
+//     } catch (err) {
+//       console.error(`\n❌ Failed: ${store.name}/${category.slug}: ${err.message}`);
+//       log('ERROR', 'index.js', 'scrapeAll', `Failed: ${store.name}/${category.slug}: ${err.message}`);
+//       return { store: store.name, category: category.slug, success: false, error: err.message };
+//     }
+//   }));
 
+//   console.log('\n\n🎉 All stores and categories complete!');
+//   log('INFO', 'index.js', 'scrapeAll', `Run finished — ${results.filter(r => r.success).length}/${results.length} succeeded`);
 //   return results;
 // }
 

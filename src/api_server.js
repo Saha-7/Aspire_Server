@@ -1459,11 +1459,28 @@ app.post('/api/scraper-job/:jobId/cancel', requireRole(['admin', 'supervisor']),
   job.cancelRequested = true;
   const cancelledBy = req.session?.user?.email || 'unknown';
   const timestamp = new Date().toLocaleTimeString('en-IN', { hour12: false });
-  job.logs.push(`[${timestamp}] 🛑 Cancel requested by ${cancelledBy} — will stop after current category finishes.`);
+  job.logs.push(`[${timestamp}] 🛑 Cancel requested by ${cancelledBy} — will stop shortly (finishing current in-flight requests).`);
 
   console.log(`🛑 Scraper cancel requested by ${cancelledBy} | job=${req.params.jobId}`);
-  res.json({ success: true, message: 'Cancel requested — scraper will stop after current category finishes.' });
+  res.json({ success: true, message: 'Cancel requested — scraper will stop shortly, after finishing current in-flight requests.' });
 });
+
+
+// app.post('/api/scraper-job/:jobId/cancel', requireRole(['admin', 'supervisor']), (req, res) => {
+//   const job = scraperJobs.get(req.params.jobId);
+//   if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+//   if (job.status !== 'running') {
+//     return res.status(400).json({ success: false, error: 'Job is not running' });
+//   }
+
+//   job.cancelRequested = true;
+//   const cancelledBy = req.session?.user?.email || 'unknown';
+//   const timestamp = new Date().toLocaleTimeString('en-IN', { hour12: false });
+//   job.logs.push(`[${timestamp}] 🛑 Cancel requested by ${cancelledBy} — will stop after current category finishes.`);
+
+//   console.log(`🛑 Scraper cancel requested by ${cancelledBy} | job=${req.params.jobId}`);
+//   res.json({ success: true, message: 'Cancel requested — scraper will stop after current category finishes.' });
+// });
 
 
 // ── GET /api/scraper-job/:jobId/logs ──────────────────────────
