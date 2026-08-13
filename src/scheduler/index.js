@@ -43,6 +43,7 @@ require('dotenv').config();
 //
 const { v4: uuidv4 } = require('uuid');
 const { createLimiter } = require('../scraper/concurrency');
+const { createMutex }   = require('../scraper/mutex'); // ← add this
 const {
   loadInternalSkuSets,
   computeStatsForBatch,
@@ -821,6 +822,7 @@ async function updateManualScrapedAt(pool, categoryName) {
 
 
 
+
 async function runManualScraper(options = {}) {
   const log = options.log || console.log;
   const isCancelled = options.isCancelled || (() => false);
@@ -845,7 +847,7 @@ async function runManualScraper(options = {}) {
   let totalPushed = 0;
   let totalFailed = 0;
   const statsRows = [];
-  const skuMatchRows = []; // matched SKUs only, across the whole run — saved to ScrapeRunSkuMatches for CSV export
+  const skuMatchRows = [];
 
   log('Manual scraper starting...');
 
@@ -879,10 +881,25 @@ async function runManualScraper(options = {}) {
     const skuSets = await loadInternalSkuSets(pool);
     log(`Internal SKUs known: ${skuSets.allSkuSet.size} | eligible for recommendations: ${skuSets.eligibleSkuSet.size}`);
 
-    for (const group of entryGroups) {
+    // CHANGE: groups now scrape CONCURRENTLY instead of one at a time —
+    // same fix already applied to runScheduler(). Actual Bright Data
+    // concurrency is capped by the shared `limit` below.
+    const SCRAPE_CONCURRENCY = Number(process.env.SCRAPE_CONCURRENCY) || 5;
+    const limit = createLimiter(SCRAPE_CONCURRENCY);
+    log(`Concurrency: ${SCRAPE_CONCURRENCY} parallel Bright Data requests (SCRAPE_CONCURRENCY env var)`);
+
+    // CHANGE: pool is a single shared connection reassigned by
+    // getHealthySqlPool()/withSqlRetry() (for AAD token refresh). That
+    // reassignment is NOT safe if two concurrent groups both try to
+    // refresh/write at the same time — this mutex serializes just that
+    // section, while the actual scraping above it still runs fully
+    // concurrently.
+    const sqlMutex = createMutex();
+
+    await Promise.all(entryGroups.map(async (group) => {
       if (isCancelled()) {
-        log(`Cancellation requested - stopping after ${jobsDone} jobs.`);
-        break;
+        log(`Cancellation requested — skipping ${group.storeName}/${group.slug} (will retry next run)`);
+        return;
       }
 
       const resolved = resolveStoreConfig(group.storeName, group.slug);
@@ -898,7 +915,7 @@ async function runManualScraper(options = {}) {
           status: 'error',
           errorMessage: 'Store/slug not found in urls.js',
         });
-        continue;
+        return;
       }
 
       const { store, category } = resolved;
@@ -908,7 +925,10 @@ async function runManualScraper(options = {}) {
       clearCategoryCache(store.name, category.slug);
 
       try {
-        const result = await scrapeCategory(store, category);
+        // CHANGE: pass isCancelled + the shared limit through — previously
+        // scrapeCategory was called with no isCancelled at all, so Cancel
+        // couldn't actually stop a manual run mid-category.
+        const result = await scrapeCategory(store, category, isCancelled, limit);
 
         log(`Scraped: ${result.saved} products | Failed: ${result.failed}`);
 
@@ -922,7 +942,6 @@ async function runManualScraper(options = {}) {
         });
         log(`Matched (strict/simple): ${stats.MatchedStrict}/${stats.MatchedSimple} | No SKU: ${stats.NullOrEmptySku} | No internal match: ${stats.SkuNoInternalMatch}`);
 
-        // ── CSV export rows: matched SKUs only (Recommendation/Basic Match) ──
         const matchedRows = collectMatchedSkuRows(result.products || [], skuSets, {
           runId, runStartedAt,
           storeName: store.name, storeSlug: category.slug,
@@ -933,7 +952,7 @@ async function runManualScraper(options = {}) {
         if (result.saved === 0) {
           log('0 products scraped - scheduler dates not updated.');
           totalFailed++;
-          continue;
+          return;
         }
 
         totalScraped += result.saved;
@@ -944,22 +963,20 @@ async function runManualScraper(options = {}) {
             `${store.name}/${category.slug}`,
             log
           );
-
           totalPushed += pushed;
         }
 
-        // FIX: re-check pool health before every SQL write in the loop —
-        // a category that scrapes slowly (many products) can push us past
-        // the AAD token's ~60-90 min lifetime mid-job, well before we ever
-        // reach the final diagnostics save.
-        pool = await getHealthySqlPool(pool);
-        for (const categoryName of group.categoryNames) {
-          ({ pool } = await withSqlRetry(
-            pool,
-            (p) => updateManualScrapedAt(p, categoryName),
-            { log, label: `updateManualScrapedAt(${categoryName})` }
-          ));
-        }
+        // Serialized: pool health-check + write, one group at a time.
+        await sqlMutex(async () => {
+          pool = await getHealthySqlPool(pool);
+          for (const categoryName of group.categoryNames) {
+            ({ pool } = await withSqlRetry(
+              pool,
+              (p) => updateManualScrapedAt(p, categoryName),
+              { log, label: `updateManualScrapedAt(${categoryName})` }
+            ));
+          }
+        });
         log(`LastScrapedAt updated for: ${group.categoryNames.join(', ')}`);
 
         jobsDone += group.categoryNames.length;
@@ -974,15 +991,8 @@ async function runManualScraper(options = {}) {
           errorMessage: err.message,
         });
       }
-    }
+    }));
 
-    // FIX: refresh the pool one more time before the final writes — by
-    // this point the job may have run long enough for the AAD token
-    // fetched at the very start to have expired. withSqlRetry() also
-    // covers the case where it dies mid-write. Neither of these two
-    // blocks is allowed to throw: a diagnostics-write failure must NOT
-    // overwrite an otherwise-successful scrape+Cosmos-push run with a
-    // "Fatal error" — see FIX note on jobsDone check below.
     let diagnosticsSaved = false;
     if (statsRows.length > 0) {
       log('Saving scrape diagnostics...');
@@ -1002,7 +1012,6 @@ async function runManualScraper(options = {}) {
       }
     }
 
-    // ── Persist matched-SKU rows for the CSV export ──────────────────
     let skuMatchesSaved = false;
     if (skuMatchRows.length > 0) {
       log('Saving matched-SKU rows for CSV export...');
@@ -1030,11 +1039,6 @@ async function runManualScraper(options = {}) {
       try {
         await runCleanupMapper(log);
       } catch (err) {
-        // FIX: cleanup mapper (Cosmos -> CompetitorPrices) is also a
-        // long-ish DB operation and was previously unguarded — a failure
-        // here used to throw all the way out and get logged as the job's
-        // "Fatal error", even though scraping/Cosmos/diagnostics above
-        // may all have already succeeded.
         log(`❌ Cleanup mapper failed: ${err.message}`);
         log(`   CompetitorPrices may be stale for this run — rerun cleanup_mapper.js manually if needed.`);
       }
@@ -1053,11 +1057,13 @@ async function runManualScraper(options = {}) {
 }
 
 
-
-
 // async function runManualScraper(options = {}) {
 //   const log = options.log || console.log;
 //   const isCancelled = options.isCancelled || (() => false);
+
+//   const runId        = options.runId        || uuidv4();
+//   const startedBy    = options.startedBy     || null;
+//   const runStartedAt = options.runStartedAt  || new Date();
 
 //   const selectedCategories = [...new Set(
 //     (options.categoryNames || [])
@@ -1074,6 +1080,8 @@ async function runManualScraper(options = {}) {
 //   let totalScraped = 0;
 //   let totalPushed = 0;
 //   let totalFailed = 0;
+//   const statsRows = [];
+//   const skuMatchRows = []; // matched SKUs only, across the whole run — saved to ScrapeRunSkuMatches for CSV export
 
 //   log('Manual scraper starting...');
 
@@ -1081,9 +1089,6 @@ async function runManualScraper(options = {}) {
 //     pool = await getSqlPool();
 //     log('Connected to SQL');
 
-//     // Load live scraper config from CategoryMappings (DB-driven).
-//     // Must happen before validating selectedCategories, since the
-//     // "known categories" set now comes from the DB, not a hardcoded array.
 //     const scraperConfig = await loadScraperConfigFromDB(pool);
 
 //     if (scraperConfig.length === 0) {
@@ -1103,10 +1108,12 @@ async function runManualScraper(options = {}) {
 //     log(`Selected categories: ${selectedCategories.length}`);
 //     log(`Store/category mapping rows: ${scrapeEntries.length}`);
 
-//     // ── Group by storeName+slug — scrape each store page once even
-//     // if it maps to multiple selected internal categories ──────────
 //     const entryGroups = groupByStoreSlug(scrapeEntries);
 //     log(`Unique store pages to scrape: ${entryGroups.length}`);
+
+//     log('Loading internal product SKUs for match diagnostics...');
+//     const skuSets = await loadInternalSkuSets(pool);
+//     log(`Internal SKUs known: ${skuSets.allSkuSet.size} | eligible for recommendations: ${skuSets.eligibleSkuSet.size}`);
 
 //     for (const group of entryGroups) {
 //       if (isCancelled()) {
@@ -1120,6 +1127,13 @@ async function runManualScraper(options = {}) {
 //         log(`Config error: ${group.storeName}/${group.slug} not found in urls.js`);
 //         log(`Affected categories: ${group.categoryNames.join(', ')}`);
 //         totalFailed++;
+//         statsRows.push({
+//           runId, runStartedAt, startedBy,
+//           storeName: group.storeName, storeSlug: group.slug,
+//           categoryNames: group.categoryNames,
+//           status: 'error',
+//           errorMessage: 'Store/slug not found in urls.js',
+//         });
 //         continue;
 //       }
 
@@ -1133,6 +1147,24 @@ async function runManualScraper(options = {}) {
 //         const result = await scrapeCategory(store, category);
 
 //         log(`Scraped: ${result.saved} products | Failed: ${result.failed}`);
+
+//         const stats = computeStatsForBatch(result.products || [], skuSets);
+//         statsRows.push({
+//           runId, runStartedAt, startedBy,
+//           storeName: store.name, storeSlug: category.slug,
+//           categoryNames: group.categoryNames,
+//           status: 'ok',
+//           stats,
+//         });
+//         log(`Matched (strict/simple): ${stats.MatchedStrict}/${stats.MatchedSimple} | No SKU: ${stats.NullOrEmptySku} | No internal match: ${stats.SkuNoInternalMatch}`);
+
+//         // ── CSV export rows: matched SKUs only (Recommendation/Basic Match) ──
+//         const matchedRows = collectMatchedSkuRows(result.products || [], skuSets, {
+//           runId, runStartedAt,
+//           storeName: store.name, storeSlug: category.slug,
+//           categoryNames: group.categoryNames,
+//         });
+//         skuMatchRows.push(...matchedRows);
 
 //         if (result.saved === 0) {
 //           log('0 products scraped - scheduler dates not updated.');
@@ -1152,11 +1184,17 @@ async function runManualScraper(options = {}) {
 //           totalPushed += pushed;
 //         }
 
-//         // Update LastScrapedAt only — does NOT touch NextScrapDueAt
-//         // so the auto-scheduler's due-date logic stays unaffected.
-//         // Stamp for EVERY internal category this store/slug maps to.
+//         // FIX: re-check pool health before every SQL write in the loop —
+//         // a category that scrapes slowly (many products) can push us past
+//         // the AAD token's ~60-90 min lifetime mid-job, well before we ever
+//         // reach the final diagnostics save.
+//         pool = await getHealthySqlPool(pool);
 //         for (const categoryName of group.categoryNames) {
-//           await updateManualScrapedAt(pool, categoryName);
+//           ({ pool } = await withSqlRetry(
+//             pool,
+//             (p) => updateManualScrapedAt(p, categoryName),
+//             { log, label: `updateManualScrapedAt(${categoryName})` }
+//           ));
 //         }
 //         log(`LastScrapedAt updated for: ${group.categoryNames.join(', ')}`);
 
@@ -1164,12 +1202,78 @@ async function runManualScraper(options = {}) {
 //       } catch (err) {
 //         log(`Failed ${store.name}/${category.slug}: ${err.message}`);
 //         totalFailed++;
+//         statsRows.push({
+//           runId, runStartedAt, startedBy,
+//           storeName: store.name, storeSlug: category.slug,
+//           categoryNames: group.categoryNames,
+//           status: 'error',
+//           errorMessage: err.message,
+//         });
 //       }
+//     }
+
+//     // FIX: refresh the pool one more time before the final writes — by
+//     // this point the job may have run long enough for the AAD token
+//     // fetched at the very start to have expired. withSqlRetry() also
+//     // covers the case where it dies mid-write. Neither of these two
+//     // blocks is allowed to throw: a diagnostics-write failure must NOT
+//     // overwrite an otherwise-successful scrape+Cosmos-push run with a
+//     // "Fatal error" — see FIX note on jobsDone check below.
+//     let diagnosticsSaved = false;
+//     if (statsRows.length > 0) {
+//       log('Saving scrape diagnostics...');
+//       try {
+//         pool = await getHealthySqlPool(pool);
+//         ({ pool } = await withSqlRetry(
+//           pool,
+//           (p) => saveRunStats(p, statsRows),
+//           { log, label: 'saveRunStats' }
+//         ));
+//         log(`Saved diagnostics for ${statsRows.length} store/category batches (RunId=${runId})`);
+//         diagnosticsSaved = true;
+//       } catch (err) {
+//         log(`❌ Diagnostics save failed even after reconnect: ${err.message}`);
+//         log(`⚠️  Scrape + Cosmos push for this run were NOT lost — only the`);
+//         log(`   Scrape Stats page row is missing. RunId=${runId} needs a manual backfill.`);
+//       }
+//     }
+
+//     // ── Persist matched-SKU rows for the CSV export ──────────────────
+//     let skuMatchesSaved = false;
+//     if (skuMatchRows.length > 0) {
+//       log('Saving matched-SKU rows for CSV export...');
+//       try {
+//         pool = await getHealthySqlPool(pool);
+//         ({ pool } = await withSqlRetry(
+//           pool,
+//           (p) => saveSkuMatchRows(p, skuMatchRows),
+//           { log, label: 'saveSkuMatchRows' }
+//         ));
+//         log(`Saved ${skuMatchRows.length} matched SKUs (RunId=${runId})`);
+//         skuMatchesSaved = true;
+//       } catch (err) {
+//         log(`❌ SKU match rows save failed even after reconnect: ${err.message}`);
+//         log(`   RunId=${runId} needs a manual backfill for ScrapeRunSkuMatches too.`);
+//       }
+//     }
+
+//     if (!diagnosticsSaved || !skuMatchesSaved) {
+//       log(`⚠️  Diagnostics incomplete for RunId=${runId} — Scrape Stats page will not show this run until backfilled.`);
 //     }
 
 //     if (jobsDone > 0) {
 //       log('Running cleanup mapper...');
-//       await runCleanupMapper(log);
+//       try {
+//         await runCleanupMapper(log);
+//       } catch (err) {
+//         // FIX: cleanup mapper (Cosmos -> CompetitorPrices) is also a
+//         // long-ish DB operation and was previously unguarded — a failure
+//         // here used to throw all the way out and get logged as the job's
+//         // "Fatal error", even though scraping/Cosmos/diagnostics above
+//         // may all have already succeeded.
+//         log(`❌ Cleanup mapper failed: ${err.message}`);
+//         log(`   CompetitorPrices may be stale for this run — rerun cleanup_mapper.js manually if needed.`);
+//       }
 //     } else {
 //       log('No jobs completed - skipping cleanup mapper.');
 //     }
@@ -1183,6 +1287,10 @@ async function runManualScraper(options = {}) {
 //     if (pool) await pool.close();
 //   }
 // }
+
+
+
+
 
 
 
