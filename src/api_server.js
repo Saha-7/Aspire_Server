@@ -1372,7 +1372,8 @@ function findCategoryConflicts(categoryNames) {
         break;
       }
 
-      if (job.status === 'done' && job.finishedAt) {
+      const actuallySucceeded = !job.succeededCategories || job.succeededCategories.includes(category);
+      if (job.status === 'done' && job.finishedAt && actuallySucceeded) {
         const hoursSince = (now - new Date(job.finishedAt).getTime()) / 3_600_000;
         if (hoursSince < COMPLETED_LOCK_HOURS &&
             (!blockingJob || new Date(job.finishedAt) > new Date(blockingJob.finishedAt))) {
@@ -1468,7 +1469,7 @@ if (categoryNames.length === 0) {
 // });
 
 //
-await runManualScraper({
+const outcome = await runManualScraper({
   categoryNames,
   log        : jobLog,
   isCancelled: () => job.cancelRequested,
@@ -1477,14 +1478,26 @@ await runManualScraper({
   runStartedAt: new Date(job.startedAt),
 });
 //
+      job.succeededCategories = outcome?.succeededCategories || [];
+      job.failedCategories    = outcome?.failedCategories || [];
+
       if (job.cancelRequested) {
         job.status     = 'cancelled';
         job.finishedAt = new Date().toISOString();
         jobLog('🛑 Scraper was cancelled by user.');
         console.log(`🛑 Scraper cancelled | job=${id}`);
+      } else if (job.succeededCategories.length === 0 && job.failedCategories.length > 0) {
+        job.status     = 'error';
+        job.error      = `0 products scraped for: ${job.failedCategories.join(', ')} — likely Bright Data throttling/blocking, not empty categories.`;
+        job.finishedAt = new Date().toISOString();
+        jobLog(`❌ ${job.error}`);
+        console.log(`❌ Manual scraper produced no data | job=${id}`);
       } else {
         job.status     = 'done';
         job.finishedAt = new Date().toISOString();
+        if (job.failedCategories.length > 0) {
+          jobLog(`⚠️  Completed with partial failures — no data for: ${job.failedCategories.join(', ')} (not locked, safe to retry).`);
+        }
         jobLog('✅ Scraper completed successfully.');
         console.log(`✅ Manual scraper done | job=${id}`);
       }
@@ -1517,6 +1530,7 @@ app.get('/api/scraper-jobs/active', requireAuth, (req, res) => {
       startedAt    : job.startedAt,
       finishedAt   : job.finishedAt,
       error        : job.error,
+      failedCategories: job.failedCategories || [],
     }))
     .sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt))
     .slice(0, 10);
