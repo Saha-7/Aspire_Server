@@ -1348,6 +1348,57 @@ const scraperJobs = new Map();
 //   finishedAt     : null | ISO string,
 // }
 
+
+
+
+
+const COMPLETED_LOCK_HOURS = 48; // a successfully-done category stays locked this long
+
+// A category is blocked if some job for it is 'running', or finished
+// 'done' within the last 48h. 'error'/'cancelled' jobs never block.
+function findCategoryConflicts(categoryNames) {
+  const requested = new Set(categoryNames);
+  const conflicts = [];
+  const now = Date.now();
+
+  for (const category of requested) {
+    let blockingJob = null;
+
+    for (const job of scraperJobs.values()) {
+      if (!job.categoryNames?.includes(category)) continue;
+
+      if (job.status === 'running') {
+        blockingJob = job;
+        break;
+      }
+
+      if (job.status === 'done' && job.finishedAt) {
+        const hoursSince = (now - new Date(job.finishedAt).getTime()) / 3_600_000;
+        if (hoursSince < COMPLETED_LOCK_HOURS &&
+            (!blockingJob || new Date(job.finishedAt) > new Date(blockingJob.finishedAt))) {
+          blockingJob = job;
+        }
+      }
+    }
+
+    if (blockingJob) {
+      conflicts.push({
+        categoryName: category,
+        status      : blockingJob.status,
+        startedBy   : blockingJob.startedBy,
+        startedAt   : blockingJob.startedAt,
+        finishedAt  : blockingJob.finishedAt,
+      });
+    }
+  }
+
+  return conflicts;
+}
+
+
+
+
+
 // ── POST /api/run-scraper ─────────────────────────────────────
 // Triggers the full scheduler (all due categories) on demand.
 // Role gate: admin + supervisor only.
@@ -1366,11 +1417,21 @@ if (categoryNames.length === 0) {
   });
 }
 
-  const alreadyRunning = [...scraperJobs.values()].find(j => j.status === 'running');
-  if (alreadyRunning) {
+  // const alreadyRunning = [...scraperJobs.values()].find(j => j.status === 'running');
+  // if (alreadyRunning) {
+  //   return res.status(409).json({
+  //     success: false,
+  //     error  : 'Scraper is already running. Wait for it to finish.',
+  //   });
+  // }
+
+
+  const conflicts = findCategoryConflicts(categoryNames);
+  if (conflicts.length > 0) {
     return res.status(409).json({
       success: false,
-      error  : 'Scraper is already running. Wait for it to finish.',
+      error: `${conflicts.length} selected categor${conflicts.length === 1 ? 'y is' : 'ies are'} already in progress or recently completed.`,
+      conflicts,
     });
   }
 
@@ -1378,6 +1439,7 @@ if (categoryNames.length === 0) {
     status         : 'running',
     startedAt      : new Date().toISOString(),
     startedBy,
+    categoryNames,
     cancelRequested: false,
     logs           : [],
     error          : null,
@@ -1437,6 +1499,33 @@ await runManualScraper({
 
   res.json({ success: true, jobId: id });
 });
+
+
+
+
+// ── GET /api/scraper-jobs/active ───────────────────────────────
+// Global, cross-user view — any logged-in user can see this. Shows
+// the last 10 jobs regardless of status/age. Blocking (above) always
+// scans the full Map, independent of this 10-item display cap.
+app.get('/api/scraper-jobs/active', requireAuth, (req, res) => {
+  const jobs = [...scraperJobs.entries()]
+    .map(([jobId, job]) => ({
+      jobId,
+      status       : job.status,
+      startedBy    : job.startedBy,
+      categoryNames: job.categoryNames || [],
+      startedAt    : job.startedAt,
+      finishedAt   : job.finishedAt,
+      error        : job.error,
+    }))
+    .sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt))
+    .slice(0, 10);
+
+  res.json({ success: true, data: jobs });
+});
+
+
+
 
 
 // ── GET /api/scraper-job/:jobId ───────────────────────────────
