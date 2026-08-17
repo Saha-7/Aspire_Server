@@ -42,8 +42,7 @@ require('dotenv').config();
 
 //
 const { v4: uuidv4 } = require('uuid');
-const { createLimiter } = require('../scraper/concurrency');
-const { createMutex }   = require('../scraper/mutex'); // ← add this
+const { createLimiter, getGlobalScrapeLimiter } = require('../scraper/concurrency');const { createMutex }   = require('../scraper/mutex'); // ← add this
 const {
   loadInternalSkuSets,
   computeStatsForBatch,
@@ -679,8 +678,8 @@ async function runScheduler(options = {}) {
     log(`\n🚀 Starting scrapes for ${dueGroups.length} unique store pages (covering ${due.length} category mappings)...`);
 
     const SCRAPE_CONCURRENCY = Number(process.env.SCRAPE_CONCURRENCY) || 8;
-    const limit = createLimiter(SCRAPE_CONCURRENCY); // ONE shared cap across every group below
-    log(`⚙️  Concurrency: ${SCRAPE_CONCURRENCY} parallel Bright Data requests (SCRAPE_CONCURRENCY env var)`);
+    const limit = getGlobalScrapeLimiter(SCRAPE_CONCURRENCY);
+    log(`⚙️  Concurrency: ${SCRAPE_CONCURRENCY} parallel Bright Data requests (SCRAPE_CONCURRENCY env var, shared globally)`);
 
     let totalScraped   = 0;
     let totalFailed    = 0;
@@ -848,6 +847,8 @@ async function runManualScraper(options = {}) {
   let totalFailed = 0;
   const statsRows = [];
   const skuMatchRows = [];
+  const succeededCategories = new Set();
+  const failedCategories = new Set(); 
 
   log('Manual scraper starting...');
 
@@ -885,8 +886,8 @@ async function runManualScraper(options = {}) {
     // same fix already applied to runScheduler(). Actual Bright Data
     // concurrency is capped by the shared `limit` below.
     const SCRAPE_CONCURRENCY = Number(process.env.SCRAPE_CONCURRENCY) || 5;
-    const limit = createLimiter(SCRAPE_CONCURRENCY);
-    log(`Concurrency: ${SCRAPE_CONCURRENCY} parallel Bright Data requests (SCRAPE_CONCURRENCY env var)`);
+    const limit = getGlobalScrapeLimiter(SCRAPE_CONCURRENCY);
+    log(`Concurrency: ${SCRAPE_CONCURRENCY} parallel Bright Data requests (SCRAPE_CONCURRENCY env var, shared globally)`);
 
     // CHANGE: pool is a single shared connection reassigned by
     // getHealthySqlPool()/withSqlRetry() (for AAD token refresh). That
@@ -907,6 +908,7 @@ async function runManualScraper(options = {}) {
       if (!resolved) {
         log(`Config error: ${group.storeName}/${group.slug} not found in urls.js`);
         log(`Affected categories: ${group.categoryNames.join(', ')}`);
+        group.categoryNames.forEach(c => failedCategories.add(c));
         totalFailed++;
         statsRows.push({
           runId, runStartedAt, startedBy,
@@ -950,7 +952,8 @@ async function runManualScraper(options = {}) {
         skuMatchRows.push(...matchedRows);
 
         if (result.saved === 0) {
-          log('0 products scraped - scheduler dates not updated.');
+          log(`⚠️  0 products scraped for ${group.categoryNames.join(', ')} — likely blocked/throttled by Bright Data, not a real empty category. Scheduler dates not updated, category will NOT be locked.`);
+          group.categoryNames.forEach(c => failedCategories.add(c));
           totalFailed++;
           return;
         }
@@ -979,9 +982,11 @@ async function runManualScraper(options = {}) {
         });
         log(`LastScrapedAt updated for: ${group.categoryNames.join(', ')}`);
 
+        group.categoryNames.forEach(c => succeededCategories.add(c));
         jobsDone += group.categoryNames.length;
       } catch (err) {
         log(`Failed ${store.name}/${category.slug}: ${err.message}`);
+        group.categoryNames.forEach(c => failedCategories.add(c));
         totalFailed++;
         statsRows.push({
           runId, runStartedAt, startedBy,
@@ -1051,6 +1056,15 @@ async function runManualScraper(options = {}) {
     log(`Products scraped: ${totalScraped}`);
     log(`Cosmos pushed: ${totalPushed}`);
     log(`Failed/skipped: ${totalFailed}`);
+
+    return {
+      succeededCategories: [...succeededCategories],
+      failedCategories   : [...failedCategories],
+      totalScraped,
+      totalPushed,
+      totalFailed,
+      jobsDone,
+    };
   } finally {
     if (pool) await pool.close();
   }
