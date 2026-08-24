@@ -122,7 +122,7 @@ app.get('/callback', async (req, res) => {
 
   } catch (err) {
     console.error('Auth callback error:', err.message);
-    res.status(500).send('Login failed');
+    res.status(500).send('Login failed 1');
   }
 });
 
