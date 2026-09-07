@@ -1063,6 +1063,7 @@ app.get('/api/category-settings', requireAuth, async (req, res) => {
         cs.GST,
         cs.CostOfBusiness,
         cs.ProfitMargin,
+        cs.PPLookbackDays,
         cs.ScrapFreqDays,
         cs.IsScrapEnabled,
         cs.UpdatedAt,
@@ -1071,20 +1072,13 @@ app.get('/api/category-settings', requireAuth, async (req, res) => {
       FROM CategorySettings cs
       LEFT JOIN InternalProducts ip ON ip.Category = cs.CategoryName
       GROUP BY
-        cs.CategoryName,
-        cs.GST,
-        cs.CostOfBusiness,
-        cs.ProfitMargin,
-        cs.ScrapFreqDays,
-        cs.IsScrapEnabled,
-        cs.UpdatedAt,
-        cs.UpdatedBy
+        cs.CategoryName, cs.GST, cs.CostOfBusiness, cs.ProfitMargin,
+        cs.PPLookbackDays, cs.ScrapFreqDays, cs.IsScrapEnabled,
+        cs.UpdatedAt, cs.UpdatedBy
       ORDER BY cs.CategoryName
     `);
-    console.log(`✅ /api/category-settings — ${result.recordset.length} rows`);
     res.json({ success: true, data: result.recordset });
   } catch (err) {
-    console.error('❌ /api/category-settings error:', err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
     if (pool) await pool.close();
@@ -1092,10 +1086,52 @@ app.get('/api/category-settings', requireAuth, async (req, res) => {
 });
 
 
+
+// app.get('/api/category-settings', requireAuth, async (req, res) => {
+//   let pool;
+//   try {
+//     pool = await getSqlPool();
+//     const result = await pool.request().query(`
+//       SELECT
+//         cs.CategoryName,
+//         cs.GST,
+//         cs.CostOfBusiness,
+//         cs.ProfitMargin,
+//         cs.ScrapFreqDays,
+//         cs.IsScrapEnabled,
+//         cs.UpdatedAt,
+//         cs.UpdatedBy,
+//         MAX(ip.LastScrapedAt) AS LastScrapedAt
+//       FROM CategorySettings cs
+//       LEFT JOIN InternalProducts ip ON ip.Category = cs.CategoryName
+//       GROUP BY
+//         cs.CategoryName,
+//         cs.GST,
+//         cs.CostOfBusiness,
+//         cs.ProfitMargin,
+//         cs.ScrapFreqDays,
+//         cs.IsScrapEnabled,
+//         cs.UpdatedAt,
+//         cs.UpdatedBy
+//       ORDER BY cs.CategoryName
+//     `);
+//     console.log(`✅ /api/category-settings — ${result.recordset.length} rows`);
+//     res.json({ success: true, data: result.recordset });
+//   } catch (err) {
+//     console.error('❌ /api/category-settings error:', err.message);
+//     res.status(500).json({ success: false, error: err.message });
+//   } finally {
+//     if (pool) await pool.close();
+//   }
+// });
+
+
+
+
 // ── PUT /api/category-settings/:category ─────────────────────
 app.put('/api/category-settings/:category', requireAuth, async (req, res) => {
   const categoryName = decodeURIComponent(req.params.category);
-  const { GST, CostOfBusiness, ProfitMargin, ScrapFreqDays, IsScrapEnabled } = req.body;
+  const { GST, CostOfBusiness, ProfitMargin, PPLookbackDays, ScrapFreqDays, IsScrapEnabled } = req.body;
   const updatedBy = req.session?.user?.email || 'unknown';
 
   if (GST !== undefined && GST !== null) {
@@ -1116,6 +1152,12 @@ app.put('/api/category-settings/:category', requireAuth, async (req, res) => {
       return res.status(400).json({ success: false, error: 'ProfitMargin must be between 0 and 100' });
     }
   }
+  if (PPLookbackDays !== undefined && PPLookbackDays !== null) {
+    const v = parseInt(PPLookbackDays);
+    if (isNaN(v) || v < 1 || v > 365) {
+      return res.status(400).json({ success: false, error: 'PPLookbackDays must be between 1 and 365' });
+    }
+  }
   if (ScrapFreqDays !== undefined && ScrapFreqDays !== null) {
     const v = parseInt(ScrapFreqDays);
     if (isNaN(v) || v < 1 || v > 365) {
@@ -1132,6 +1174,7 @@ app.put('/api/category-settings/:category', requireAuth, async (req, res) => {
       .input('GST',             sql.Decimal(5, 2),  GST            ?? null)
       .input('CostOfBusiness',  sql.Decimal(5, 2),  CostOfBusiness ?? null)
       .input('ProfitMargin',    sql.Decimal(5, 2),  ProfitMargin   ?? null)
+      .input('PPLookbackDays',  sql.Int,             PPLookbackDays ?? null)
       .input('ScrapFreqDays',   sql.Int,             ScrapFreqDays  ?? 7)
       .input('IsScrapEnabled',  sql.Bit,             IsScrapEnabled ?? 1)
       .input('UpdatedBy',       sql.NVarChar(150),   updatedBy)
@@ -1145,33 +1188,119 @@ app.put('/api/category-settings/:category', requireAuth, async (req, res) => {
             GST            = @GST,
             CostOfBusiness = @CostOfBusiness,
             ProfitMargin   = @ProfitMargin,
+            PPLookbackDays = @PPLookbackDays,
             ScrapFreqDays  = @ScrapFreqDays,
             IsScrapEnabled = @IsScrapEnabled,
             UpdatedAt      = GETDATE(),
             UpdatedBy      = @UpdatedBy
 
         WHEN NOT MATCHED THEN
-          INSERT (CategoryName, GST, CostOfBusiness, ProfitMargin,
+          INSERT (CategoryName, GST, CostOfBusiness, ProfitMargin, PPLookbackDays,
                   ScrapFreqDays, IsScrapEnabled, UpdatedAt, UpdatedBy)
-          VALUES (@CategoryName, @GST, @CostOfBusiness, @ProfitMargin,
+          VALUES (@CategoryName, @GST, @CostOfBusiness, @ProfitMargin, @PPLookbackDays,
                   @ScrapFreqDays, @IsScrapEnabled, GETDATE(), @UpdatedBy);
 
-        SELECT CategoryName, GST, CostOfBusiness, ProfitMargin,
+        SELECT CategoryName, GST, CostOfBusiness, ProfitMargin, PPLookbackDays,
                ScrapFreqDays, IsScrapEnabled, UpdatedAt, UpdatedBy
         FROM CategorySettings
         WHERE CategoryName = @CategoryName;
       `);
 
-    console.log(`✅ /api/category-settings/${categoryName} — updated by ${updatedBy}`);
     res.json({ success: true, data: result.recordset[0] });
-
   } catch (err) {
-    console.error(`❌ /api/category-settings/${categoryName} error:`, err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
     if (pool) await pool.close();
   }
 });
+
+
+
+
+// app.put('/api/category-settings/:category', requireAuth, async (req, res) => {
+//   const categoryName = decodeURIComponent(req.params.category);
+//   const { GST, CostOfBusiness, ProfitMargin, ScrapFreqDays, IsScrapEnabled } = req.body;
+//   const updatedBy = req.session?.user?.email || 'unknown';
+
+//   if (GST !== undefined && GST !== null) {
+//     const v = parseFloat(GST);
+//     if (isNaN(v) || v < 0 || v > 100) {
+//       return res.status(400).json({ success: false, error: 'GST must be between 0 and 100' });
+//     }
+//   }
+//   if (CostOfBusiness !== undefined && CostOfBusiness !== null) {
+//     const v = parseFloat(CostOfBusiness);
+//     if (isNaN(v) || v < 0 || v > 100) {
+//       return res.status(400).json({ success: false, error: 'CostOfBusiness must be between 0 and 100' });
+//     }
+//   }
+//   if (ProfitMargin !== undefined && ProfitMargin !== null) {
+//     const v = parseFloat(ProfitMargin);
+//     if (isNaN(v) || v < 0 || v > 100) {
+//       return res.status(400).json({ success: false, error: 'ProfitMargin must be between 0 and 100' });
+//     }
+//   }
+//   if (ScrapFreqDays !== undefined && ScrapFreqDays !== null) {
+//     const v = parseInt(ScrapFreqDays);
+//     if (isNaN(v) || v < 1 || v > 365) {
+//       return res.status(400).json({ success: false, error: 'ScrapFreqDays must be between 1 and 365' });
+//     }
+//   }
+
+//   let pool;
+//   try {
+//     pool = await getSqlPool();
+
+//     const result = await pool.request()
+//       .input('CategoryName',    sql.NVarChar(200),  categoryName)
+//       .input('GST',             sql.Decimal(5, 2),  GST            ?? null)
+//       .input('CostOfBusiness',  sql.Decimal(5, 2),  CostOfBusiness ?? null)
+//       .input('ProfitMargin',    sql.Decimal(5, 2),  ProfitMargin   ?? null)
+//       .input('ScrapFreqDays',   sql.Int,             ScrapFreqDays  ?? 7)
+//       .input('IsScrapEnabled',  sql.Bit,             IsScrapEnabled ?? 1)
+//       .input('UpdatedBy',       sql.NVarChar(150),   updatedBy)
+//       .query(`
+//         MERGE CategorySettings AS target
+//         USING (SELECT @CategoryName AS CategoryName) AS source
+//           ON target.CategoryName = source.CategoryName
+
+//         WHEN MATCHED THEN
+//           UPDATE SET
+//             GST            = @GST,
+//             CostOfBusiness = @CostOfBusiness,
+//             ProfitMargin   = @ProfitMargin,
+//             ScrapFreqDays  = @ScrapFreqDays,
+//             IsScrapEnabled = @IsScrapEnabled,
+//             UpdatedAt      = GETDATE(),
+//             UpdatedBy      = @UpdatedBy
+
+//         WHEN NOT MATCHED THEN
+//           INSERT (CategoryName, GST, CostOfBusiness, ProfitMargin,
+//                   ScrapFreqDays, IsScrapEnabled, UpdatedAt, UpdatedBy)
+//           VALUES (@CategoryName, @GST, @CostOfBusiness, @ProfitMargin,
+//                   @ScrapFreqDays, @IsScrapEnabled, GETDATE(), @UpdatedBy);
+
+//         SELECT CategoryName, GST, CostOfBusiness, ProfitMargin,
+//                ScrapFreqDays, IsScrapEnabled, UpdatedAt, UpdatedBy
+//         FROM CategorySettings
+//         WHERE CategoryName = @CategoryName;
+//       `);
+
+//     console.log(`✅ /api/category-settings/${categoryName} — updated by ${updatedBy}`);
+//     res.json({ success: true, data: result.recordset[0] });
+
+//   } catch (err) {
+//     console.error(`❌ /api/category-settings/${categoryName} error:`, err.message);
+//     res.status(500).json({ success: false, error: err.message });
+//   } finally {
+//     if (pool) await pool.close();
+//   }
+// });
+
+
+
+
+
 
 
 // ── GET /api/users ────────────────────────────────────────────
