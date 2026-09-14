@@ -654,6 +654,38 @@ app.get('/api/competitor-details/:skuId', async (req, res) => {
 });
 
 
+// // ── GET /api/pp-products ──────────────────────────────────────
+// app.get('/api/pp-products', requireAuth, async (req, res) => {
+//   let pool;
+//   try {
+//     pool = await getSqlPool();
+//     const result = await pool.request().query(`
+//       SELECT
+//         SKU_ID, Title, Category, Brand, PP,
+//         LastBillDate, ManualPP_UpdatedAt, ManualPP_UpdatedBy,
+//         CASE
+//           WHEN ManualPP_UpdatedAt IS NOT NULL AND LastBillDate IS NOT NULL
+//            AND ManualPP_UpdatedAt >= CAST(LastBillDate AS DATETIME2) THEN 'manual'
+//           WHEN ManualPP_UpdatedAt IS NOT NULL AND LastBillDate IS NULL THEN 'manual'
+//           ELSE 'bill'
+//         END AS PPSource
+//       FROM InternalProducts
+//       WHERE isActive = 1
+//       ORDER BY Category, Title
+//     `);
+//     console.log(`✅ /api/pp-products — ${result.recordset.length} rows`);
+//     res.json({ success: true, data: result.recordset });
+//   } catch (err) {
+//     console.error('❌ /api/pp-products error:', err.message);
+//     res.status(500).json({ success: false, error: err.message });
+//   } finally {
+//     if (pool) await pool.close();
+//   }
+// });
+
+
+
+
 // ── GET /api/pp-products ──────────────────────────────────────
 app.get('/api/pp-products', requireAuth, async (req, res) => {
   let pool;
@@ -661,7 +693,7 @@ app.get('/api/pp-products', requireAuth, async (req, res) => {
     pool = await getSqlPool();
     const result = await pool.request().query(`
       SELECT
-        SKU_ID, Title, Category, Brand, PP,
+        SKU_ID, Title, Category, Brand, PP, isActive, isInStock,
         LastBillDate, ManualPP_UpdatedAt, ManualPP_UpdatedBy,
         CASE
           WHEN ManualPP_UpdatedAt IS NOT NULL AND LastBillDate IS NOT NULL
@@ -682,6 +714,8 @@ app.get('/api/pp-products', requireAuth, async (req, res) => {
     if (pool) await pool.close();
   }
 });
+
+
 
 
 // ── PATCH /api/update-pp ──────────────────────────────────────
