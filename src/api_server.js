@@ -27,6 +27,9 @@ const {
   getBusinessVars,      // ← NEW
 } = require('./recommendation_engine');
 
+
+const { getInsights, dismissInsight } = require('./services/insightsService');
+
 const { scrapeProduct }    = require('./scraper/scrapeProduct');
 const { upsertOneProduct } = require('./services/competitorPriceService');
 const { STORES }           = require('./urls');
@@ -766,6 +769,54 @@ app.get('/api/pp-template-csv', requireAuth, (req, res) => {
   res.setHeader('Content-Disposition', 'attachment; filename="pp_update_template.csv"');
   res.send('SKU,PP\n');
 });
+
+
+
+
+
+// ── GET /api/insights ────────────────────────────────────────
+app.get('/api/insights', requireAuth, async (req, res) => {
+  const { category, minThreshold } = req.query;
+  let pool;
+  try {
+    pool = await getSqlPool();
+    const result = await getInsights(pool, {
+      category: category || null,
+      minThresholdPct: minThreshold != null ? parseFloat(minThreshold) : null,
+    });
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('❌ /api/insights error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+// ── POST /api/insights/:id/dismiss ──────────────────────────────
+app.post('/api/insights/:id/dismiss', requireAuth, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (isNaN(id)) return res.status(400).json({ success: false, error: 'Invalid alert id' });
+  const dismissedBy = req.session?.user?.email || 'unknown';
+  let pool;
+  try {
+    pool = await getSqlPool();
+    const updated = await dismissInsight(pool, id, dismissedBy);
+    if (!updated) return res.status(404).json({ success: false, error: 'Alert not found' });
+    res.json({ success: true, data: updated });
+  } catch (err) {
+    console.error('❌ /api/insights/:id/dismiss error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
+
+
+
+
 
 
 // ── POST /api/validate-skus ───────────────────────────────────
