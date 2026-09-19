@@ -4,6 +4,9 @@
 require('dotenv').config();
 
 
+
+
+
 //
 const { getRecentRuns, getRunDetail, getRunSkuMatches, buildSkuMatchesCsv } = require('./services/scrapeStatsService');
 //
@@ -28,7 +31,7 @@ const {
 } = require('./recommendation_engine');
 
 
-const { getInsights, dismissInsight } = require('./services/insightsService');
+const { getInsights, dismissInsight, bulkDismissInsights } = require('./services/insightsService');
 
 const { scrapeProduct }    = require('./scraper/scrapeProduct');
 const { upsertOneProduct } = require('./services/competitorPriceService');
@@ -774,24 +777,49 @@ app.get('/api/pp-template-csv', requireAuth, (req, res) => {
 
 
 
+
+
+
+
 // ── GET /api/insights ────────────────────────────────────────
 app.get('/api/insights', requireAuth, async (req, res) => {
-  const { category, minThreshold } = req.query;
-  let pool;
   try {
-    pool = await getSqlPool();
+    const pool = await getHealthySqlPool();
+    const { category, alertType, search, sortBy, page, pageSize, minThreshold, skipRecompute } = req.query;
     const result = await getInsights(pool, {
       category: category || null,
+      alertType: alertType || null,
+      search: search || null,
+      sortBy: sortBy || 'newest',
+      page: page ? parseInt(page, 10) : null,
+      pageSize: pageSize ? parseInt(pageSize, 10) : null,
       minThresholdPct: minThreshold != null ? parseFloat(minThreshold) : null,
+      skipRecompute: skipRecompute === 'true',
     });
     res.json({ success: true, ...result });
   } catch (err) {
     console.error('❌ /api/insights error:', err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
+
+app.post('/api/insights/dismiss-bulk', requireAuth, async (req, res) => {
+  try {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ success: false, error: 'ids must be a non-empty array' });
+    }
+    const pool = await getHealthySqlPool();
+    const dismissedIds = await bulkDismissInsights(pool, ids, req.user?.email || 'unknown');
+    res.json({ success: true, data: dismissedIds });
+  } catch (err) {
+    console.error('❌ /api/insights/dismiss-bulk error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
+
 
 // ── POST /api/insights/:id/dismiss ──────────────────────────────
 app.post('/api/insights/:id/dismiss', requireAuth, async (req, res) => {
@@ -811,6 +839,9 @@ app.post('/api/insights/:id/dismiss', requireAuth, async (req, res) => {
     if (pool) await pool.close();
   }
 });
+
+
+
 
 
 
