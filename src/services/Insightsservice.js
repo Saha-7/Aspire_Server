@@ -25,7 +25,7 @@
 // data before relying on it for the NO_LISTING category filter.
 // ─────────────────────────────────────────────────────────────
 
-const sql = require('mssql');
+const sql = require("mssql");
 
 const DEFAULT_THRESHOLD_PCT = 2;
 
@@ -103,7 +103,7 @@ async function computeOOSAlerts(pool) {
     HAVING COUNT(DISTINCT cp.StoreName) >= 2
   `);
 
-  return result.recordset.map(row => ({
+  return result.recordset.map((row) => ({
     SKU_ID: row.SKU_ID,
     Title: row.Title,
     Category: row.Category,
@@ -135,10 +135,10 @@ async function computeNoListingAlerts(pool) {
     HAVING COUNT(DISTINCT cp.StoreName) >= 2
   `);
 
-  return result.recordset.map(row => ({
+  return result.recordset.map((row) => ({
     SKU_ID: row.SKU_ID,
     Title: row.Title,
-    Category: null,   // see note above
+    Category: null, // see note above
     CurrentValue: `stores:${row.ListedStores}`,
     _listedStores: row.ListedStores,
     _storeCount: row.StoreCount,
@@ -147,15 +147,21 @@ async function computeNoListingAlerts(pool) {
 
 // ── TVP for the reconcile MERGE ────────────────────────────────
 function buildTVP(alertType, rows) {
-  const table = new sql.Table('InsightAlertsType');
-  table.columns.add('SKU_ID',       sql.NVarChar(100));
-  table.columns.add('AlertType',    sql.NVarChar(20));
-  table.columns.add('Category',     sql.NVarChar(200));
-  table.columns.add('Title',        sql.NVarChar(500));
-  table.columns.add('CurrentValue', sql.NVarChar(200));
+  const table = new sql.Table("InsightAlertsType");
+  table.columns.add("SKU_ID", sql.NVarChar(100));
+  table.columns.add("AlertType", sql.NVarChar(20));
+  table.columns.add("Category", sql.NVarChar(200));
+  table.columns.add("Title", sql.NVarChar(500));
+  table.columns.add("CurrentValue", sql.NVarChar(200));
 
   for (const row of rows) {
-    table.rows.add(row.SKU_ID, alertType, row.Category ?? null, row.Title ?? null, row.CurrentValue ?? null);
+    table.rows.add(
+      row.SKU_ID,
+      alertType,
+      row.Category ?? null,
+      row.Title ?? null,
+      row.CurrentValue ?? null,
+    );
   }
   return table;
 }
@@ -166,70 +172,69 @@ function buildTVP(alertType, rows) {
 async function reconcileAlertType(pool, alertType, computedRows) {
   const tvp = buildTVP(alertType, computedRows);
 
-  await pool.request()
-    .input('tvp', tvp)
-    .input('AlertType', sql.NVarChar(20), alertType)
-    .query(`
+  await pool
+    .request()
+    .input("tvp", tvp)
+    .input("AlertType", sql.NVarChar(20), alertType).query(`
       MERGE InsightAlerts AS target
-      USING @tvp AS source
-        ON target.SKU_ID = source.SKU_ID AND target.AlertType = source.AlertType
+USING @tvp AS source
+  ON target.SKU_ID = source.SKU_ID AND target.AlertType = source.AlertType
 
-      -- Still dismissed, and nothing has changed since dismissal — stay dismissed.
-      WHEN MATCHED AND target.Status = 'dismissed'
-                    AND target.SnapshotValue = source.CurrentValue THEN
-        UPDATE SET CurrentValue = source.CurrentValue,
-                   Category     = source.Category,
-                   Title        = source.Title
+WHEN MATCHED THEN
+  UPDATE SET
+    Status = CASE
+               WHEN target.Status = 'dismissed'
+                    AND target.SnapshotValue = source.CurrentValue
+                 THEN target.Status          -- unchanged & dismissed: stay dismissed
+               ELSE 'active'                 -- otherwise: active/resolved refresh, or reopen
+             END,
+    CurrentValue    = source.CurrentValue,
+    Category        = source.Category,
+    Title           = source.Title,
+    LastTriggeredAt = CASE
+                        WHEN target.Status = 'dismissed'
+                             AND target.SnapshotValue = source.CurrentValue
+                          THEN target.LastTriggeredAt
+                        ELSE SYSDATETIME()
+                      END,
+    ResolvedAt = CASE
+                   WHEN target.Status = 'dismissed'
+                        AND target.SnapshotValue = source.CurrentValue
+                     THEN target.ResolvedAt
+                   ELSE NULL
+                 END
 
-      -- Was dismissed, but the numbers moved since then — reopen it.
-      WHEN MATCHED AND target.Status = 'dismissed'
-                    AND (target.SnapshotValue <> source.CurrentValue OR target.SnapshotValue IS NULL) THEN
-        UPDATE SET Status          = 'active',
-                   CurrentValue    = source.CurrentValue,
-                   Category        = source.Category,
-                   Title           = source.Title,
-                   LastTriggeredAt = SYSDATETIME(),
-                   ResolvedAt      = NULL
+WHEN NOT MATCHED BY TARGET THEN
+  INSERT (SKU_ID, AlertType, Category, Title, Status, CurrentValue, FirstSeenAt, LastTriggeredAt)
+  VALUES (source.SKU_ID, source.AlertType, source.Category, source.Title,
+          'active', source.CurrentValue, SYSDATETIME(), SYSDATETIME())
 
-      -- Already active (or was resolved and came back) — just refresh it.
-      WHEN MATCHED AND target.Status IN ('active', 'resolved') THEN
-        UPDATE SET Status          = 'active',
-                   CurrentValue    = source.CurrentValue,
-                   Category        = source.Category,
-                   Title           = source.Title,
-                   LastTriggeredAt = SYSDATETIME(),
-                   ResolvedAt      = NULL
-
-      -- Never seen before — brand new alert.
-      WHEN NOT MATCHED BY TARGET THEN
-        INSERT (SKU_ID, AlertType, Category, Title, Status, CurrentValue, FirstSeenAt, LastTriggeredAt)
-        VALUES (source.SKU_ID, source.AlertType, source.Category, source.Title,
-                'active', source.CurrentValue, SYSDATETIME(), SYSDATETIME())
-
-      -- Was active for this alert type, but no longer computed at all —
-      -- the underlying condition cleared (price fixed / restocked / listed now).
-      WHEN NOT MATCHED BY SOURCE AND target.AlertType = @AlertType AND target.Status = 'active' THEN
-        UPDATE SET Status = 'resolved', ResolvedAt = SYSDATETIME();
+WHEN NOT MATCHED BY SOURCE AND target.AlertType = @AlertType AND target.Status = 'active' THEN
+  UPDATE SET Status = 'resolved', ResolvedAt = SYSDATETIME();
     `);
 }
 
 // ── Main entry point — recompute + reconcile all 4 types,
 // then return the current active set (optionally filtered). ────
-async function getInsights(pool, { category = null, minThresholdPct = null } = {}) {
+async function getInsights(
+  pool,
+  { category = null, minThresholdPct = null } = {},
+) {
   const defaultThreshold = await getThresholdPct(pool);
 
-  const [{ lowAlerts, highAlerts }, oosAlerts, noListingAlerts] = await Promise.all([
-    computePriceAlerts(pool, defaultThreshold),
-    computeOOSAlerts(pool),
-    computeNoListingAlerts(pool),
-  ]);
+  const [{ lowAlerts, highAlerts }, oosAlerts, noListingAlerts] =
+    await Promise.all([
+      computePriceAlerts(pool, defaultThreshold),
+      computeOOSAlerts(pool),
+      computeNoListingAlerts(pool),
+    ]);
 
   // Reconcile each type independently so "WHEN NOT MATCHED BY SOURCE"
   // only ever resolves rows of that same type.
-  await reconcileAlertType(pool, 'LOW_PRICE',  lowAlerts);
-  await reconcileAlertType(pool, 'HIGH_PRICE', highAlerts);
-  await reconcileAlertType(pool, 'OOS',        oosAlerts);
-  await reconcileAlertType(pool, 'NO_LISTING', noListingAlerts);
+  await reconcileAlertType(pool, "LOW_PRICE", lowAlerts);
+  await reconcileAlertType(pool, "HIGH_PRICE", highAlerts);
+  await reconcileAlertType(pool, "OOS", oosAlerts);
+  await reconcileAlertType(pool, "NO_LISTING", noListingAlerts);
 
   // Now read back the current active set. category/minThresholdPct only
   // filter what's displayed — minThresholdPct can only narrow ABOVE the
@@ -239,24 +244,25 @@ async function getInsights(pool, { category = null, minThresholdPct = null } = {
   let whereClauses = [`Status = 'active'`];
 
   if (category) {
-    request.input('Category', sql.NVarChar(200), category);
-    whereClauses.push('Category = @Category');
+    request.input("Category", sql.NVarChar(200), category);
+    whereClauses.push("Category = @Category");
   }
 
   const result = await request.query(`
     SELECT Id, SKU_ID, AlertType, Category, Title, CurrentValue,
            FirstSeenAt, LastTriggeredAt
     FROM InsightAlerts
-    WHERE ${whereClauses.join(' AND ')}
+    WHERE ${whereClauses.join(" AND ")}
     ORDER BY LastTriggeredAt DESC
   `);
 
   let rows = result.recordset;
 
   if (minThresholdPct != null && !isNaN(minThresholdPct)) {
-    rows = rows.filter(r => {
-      if (r.AlertType !== 'LOW_PRICE' && r.AlertType !== 'HIGH_PRICE') return true; // OOS/NO_LISTING unaffected
-      const match = /diff:(-?\d+(\.\d+)?)/.exec(r.CurrentValue || '');
+    rows = rows.filter((r) => {
+      if (r.AlertType !== "LOW_PRICE" && r.AlertType !== "HIGH_PRICE")
+        return true; // OOS/NO_LISTING unaffected
+      const match = /diff:(-?\d+(\.\d+)?)/.exec(r.CurrentValue || "");
       if (!match) return true;
       return Math.abs(parseFloat(match[1])) >= minThresholdPct;
     });
@@ -267,10 +273,10 @@ async function getInsights(pool, { category = null, minThresholdPct = null } = {
 
 // ── Dismiss one alert ──────────────────────────────────────────
 async function dismissInsight(pool, id, dismissedBy) {
-  const result = await pool.request()
-    .input('Id', sql.Int, id)
-    .input('DismissedBy', sql.NVarChar(150), dismissedBy)
-    .query(`
+  const result = await pool
+    .request()
+    .input("Id", sql.Int, id)
+    .input("DismissedBy", sql.NVarChar(150), dismissedBy).query(`
       UPDATE InsightAlerts
       SET Status = 'dismissed', DismissedAt = SYSDATETIME(), DismissedBy = @DismissedBy,
           SnapshotValue = CurrentValue
