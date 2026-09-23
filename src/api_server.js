@@ -26,6 +26,7 @@ const {
   buildCompetitorMap,
   generateRecommendations,
   updateRecommendedSP,
+  calculateRecommendedPrice,
   resolveEffectivePP,   // ← NEW
   getBusinessVars,      // ← NEW
 } = require('./recommendation_engine');
@@ -784,7 +785,7 @@ app.get('/api/pp-template-csv', requireAuth, (req, res) => {
 // ── GET /api/insights ────────────────────────────────────────
 app.get('/api/insights', requireAuth, async (req, res) => {
   try {
-    const pool = await getHealthySqlPool();
+    const pool = await getSqlPool();
     const { category, alertType, search, sortBy, page, pageSize, minThreshold, skipRecompute } = req.query;
     const result = await getInsights(pool, {
       category: category || null,
@@ -803,13 +804,208 @@ app.get('/api/insights', requireAuth, async (req, res) => {
   }
 });
 
+
+
+
+
+
+
+
+// // ── GET /api/insights/take-action/:skuId ────────────────────────
+// // Live snapshot for the price-alert modal — not the alert's stale
+// // CurrentValue, but the actual current PP/SP/competitor state, computed
+// // with the exact same formula recommendation_engine.js uses.
+// app.get('/api/insights/take-action/:skuId', requireAuth, async (req, res) => {
+//   const { skuId } = req.params;
+//   let pool;
+//   try {
+//     pool = await getSqlPool();
+
+//     const productResult = await pool.request()
+//       .input('SKU_ID', sql.NVarChar(100), skuId)
+//       .query(`SELECT SKU_ID, Title, Category, PP, SP FROM InternalProducts WHERE SKU_ID = @SKU_ID`);
+
+//     if (!productResult.recordset.length) {
+//       return res.status(404).json({ success: false, error: `SKU not found: ${skuId}` });
+//     }
+//     const product = productResult.recordset[0];
+
+//     const competitorResult = await pool.request()
+//       .input('SKU_ID', sql.NVarChar(100), skuId)
+//       .query(`
+//         SELECT MIN(CompetitorPrice) AS LowestCompetitorPrice, MAX(ScrapedAt) AS AsOf
+//         FROM CompetitorPrices
+//         WHERE SKU = @SKU_ID AND CompetitorPrice IS NOT NULL
+//           AND StockStatus IS NOT NULL AND LOWER(StockStatus) <> 'out of stock'
+//       `);
+//     const lowestCompetitorPrice = competitorResult.recordset[0]?.LowestCompetitorPrice ?? null;
+//     const asOf = competitorResult.recordset[0]?.AsOf ?? null;
+
+//     let recommendedSP = null;
+//     if (product.PP != null) {
+//       const categorySettings = await loadCategorySettings(pool);
+//       const { gst, costOfBusiness, profitMargin } = getBusinessVars(categorySettings, product.Category);
+
+//       if (lowestCompetitorPrice != null) {
+//         const { recommendedSP: sp } = calculateRecommendedPrice(
+//           parseFloat(product.PP), parseFloat(lowestCompetitorPrice), gst, costOfBusiness, profitMargin
+//         );
+//         recommendedSP = sp;
+//       } else {
+//         // No live in-stock competitor price right now — still show the
+//         // floor price computed from PP + GST/COB/margin alone.
+//         const multiplier = 1 + gst + costOfBusiness + profitMargin;
+//         recommendedSP = parseFloat((parseFloat(product.PP) * multiplier).toFixed(2));
+//       }
+//     }
+
+//     res.json({
+//       success: true,
+//       data: {
+//         skuId: product.SKU_ID,
+//         title: product.Title,
+//         category: product.Category,
+//         pp: product.PP != null ? parseFloat(product.PP) : null,
+//         sp: product.SP != null ? parseFloat(product.SP) : null,
+//         recommendedSP,
+//         lowestCompetitorPrice: lowestCompetitorPrice != null ? parseFloat(lowestCompetitorPrice) : null,
+//         competitorPriceAsOf: asOf,
+//       },
+//     });
+//   } catch (err) {
+//     console.error(`❌ /api/insights/take-action/${skuId} error:`, err.message);
+//     res.status(500).json({ success: false, error: err.message });
+//   } finally {
+//     if (pool) await pool.close();
+//   }
+// });
+
+
+
+
+
+
+
+
+// Add this import near your other requires at the top of api_server.js:
+//   const { loadCategorySettings, getBusinessVars, calculateRecommendedPrice } = require('./recommendation_engine');
+//
+// Then drop this route in near your other /api/insights routes.
+
+// ── GET /api/insights/take-action/:skuId ────────────────────────
+// Live snapshot for the price-alert modal — not the alert's stale
+// CurrentValue, but the actual current PP/SP/competitor state, computed
+// with the exact same formula recommendation_engine.js uses.
+app.get('/api/insights/take-action/:skuId', requireAuth, async (req, res) => {
+  const { skuId } = req.params;
+  let pool;
+  try {
+    pool = await getSqlPool();
+
+    const productResult = await pool.request()
+      .input('SKU_ID', sql.NVarChar(100), skuId)
+      .query(`SELECT SKU_ID, Title, Category, PP, SP FROM InternalProducts WHERE SKU_ID = @SKU_ID`);
+
+    if (!productResult.recordset.length) {
+      return res.status(404).json({ success: false, error: `SKU not found: ${skuId}` });
+    }
+    const product = productResult.recordset[0];
+
+    // TOP 1 ORDER BY price, not separate MIN()/MAX() — a split-column
+    // approach can pair one store's price with a different store's
+    // timestamp. This way the price, store name, and "as of" timestamp
+    // are guaranteed to come from the same row.
+    const competitorResult = await pool.request()
+      .input('SKU_ID', sql.NVarChar(100), skuId)
+      .query(`
+        SELECT TOP 1 CompetitorPrice AS LowestCompetitorPrice, StoreName, ScrapedAt AS AsOf
+        FROM CompetitorPrices
+        WHERE SKU = @SKU_ID AND CompetitorPrice IS NOT NULL
+          AND StockStatus IS NOT NULL AND LOWER(StockStatus) <> 'out of stock'
+        ORDER BY CompetitorPrice ASC
+      `);
+    const lowestCompetitorPrice = competitorResult.recordset[0]?.LowestCompetitorPrice ?? null;
+    const lowestCompetitorStore = competitorResult.recordset[0]?.StoreName ?? null;
+    const asOf = competitorResult.recordset[0]?.AsOf ?? null;
+
+    let recommendedSP = null;
+    let pricingBreakdown = null; // { gstPct, costOfBusinessPct, profitMarginPct }
+
+    if (product.PP != null) {
+      const categorySettings = await loadCategorySettings(pool);
+      const { gst, costOfBusiness, profitMargin } = getBusinessVars(categorySettings, product.Category);
+
+      pricingBreakdown = {
+        gstPct: gst * 100,
+        costOfBusinessPct: costOfBusiness * 100,
+        profitMarginPct: profitMargin * 100,
+      };
+
+      if (lowestCompetitorPrice != null) {
+        const { recommendedSP: sp } = calculateRecommendedPrice(
+          parseFloat(product.PP), parseFloat(lowestCompetitorPrice), gst, costOfBusiness, profitMargin
+        );
+        recommendedSP = sp;
+      } else {
+        // No live in-stock competitor price right now — still show the
+        // floor price computed from PP + GST/COB/margin alone.
+        const multiplier = 1 + gst + costOfBusiness + profitMargin;
+        recommendedSP = parseFloat((parseFloat(product.PP) * multiplier).toFixed(2));
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        skuId: product.SKU_ID,
+        title: product.Title,
+        category: product.Category,
+        pp: product.PP != null ? parseFloat(product.PP) : null,
+        sp: product.SP != null ? parseFloat(product.SP) : null,
+        recommendedSP,
+        pricingBreakdown,
+        lowestCompetitorPrice: lowestCompetitorPrice != null ? parseFloat(lowestCompetitorPrice) : null,
+        lowestCompetitorStore,
+        competitorPriceAsOf: asOf,
+      },
+    });
+  } catch (err) {
+    console.error(`❌ /api/insights/take-action/${skuId} error:`, err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 app.post('/api/insights/dismiss-bulk', requireAuth, async (req, res) => {
   try {
     const { ids } = req.body;
     if (!Array.isArray(ids) || ids.length === 0) {
       return res.status(400).json({ success: false, error: 'ids must be a non-empty array' });
     }
-    const pool = await getHealthySqlPool();
+    const pool = await getSqlPool();
     const dismissedIds = await bulkDismissInsights(pool, ids, req.user?.email || 'unknown');
     res.json({ success: true, data: dismissedIds });
   } catch (err) {
