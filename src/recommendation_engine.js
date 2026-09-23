@@ -318,6 +318,7 @@ module.exports = {
   updateRecommendedSP,
   resolveEffectivePP,
   getBusinessVars,
+  calculateRecommendedPrice
 };
 
 
