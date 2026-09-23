@@ -76,6 +76,7 @@ const STORE_SKU_FIELDS = {
   mdcomputers: (p) => firstSku(p.productCode, p.sku, p.model, p.modelNumber),
   vedant     : (p) => firstSku(p.model, p.sku),
   fgtech     : (p) => firstSku(p.sku, p.modelNumber),
+  theitdepot: (p) => firstSku(p.model, p.sku),
 };
 
 function extractSkuAndStock(product) {
