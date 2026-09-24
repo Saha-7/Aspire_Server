@@ -976,14 +976,32 @@ app.get('/api/insights/take-action/:skuId', requireAuth, async (req, res) => {
     const lowestCompetitorStore = competitorResult.recordset[0]?.StoreName ?? null;
     const asOf = competitorResult.recordset[0]?.AsOf ?? null;
 
-    const { recommendedSP, pricingBreakdown } =
-      await computeLiveRecommendation(pool, product, lowestCompetitorPrice);
+    let recommendedSP = null;
+    let pricingBreakdown = null;
 
-    // Keep InternalProducts.RecommendedSP in sync with what this modal is
-    // about to show, so the variance check on push compares against the
-    // same number. Non-fatal: /api/push-to-shopify also has a live-compute
-    // fallback, so a failed persist must never break the modal.
-    if (recommendedSP != null) {
+    if (product.PP != null) {
+      const categorySettings = await loadCategorySettings(pool);
+      const { gst, costOfBusiness, profitMargin } = getBusinessVars(categorySettings, product.Category);
+
+      pricingBreakdown = {
+        gstPct: Math.round(gst * 10000) / 100,
+        costOfBusinessPct: Math.round(costOfBusiness * 10000) / 100,
+        profitMarginPct: Math.round(profitMargin * 10000) / 100,
+      };
+
+      if (lowestCompetitorPrice != null) {
+        const { recommendedSP: sp } = calculateRecommendedPrice(
+          parseFloat(product.PP), parseFloat(lowestCompetitorPrice), gst, costOfBusiness, profitMargin
+        );
+        recommendedSP = sp;
+      } else {
+        const multiplier = 1 + gst + costOfBusiness + profitMargin;
+        recommendedSP = Math.round(parseFloat(product.PP) * multiplier);
+      }
+
+      // Keep InternalProducts.RecommendedSP in sync with what this modal shows,
+      // so the variance check on push compares against the same number.
+      // Non-fatal: a failed save must never stop the modal from loading.
       try {
         await persistRecommendedSP(pool, [{ SKU_ID: skuId, RecommendedSP: recommendedSP }]);
       } catch (persistErr) {
