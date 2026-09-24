@@ -811,10 +811,18 @@ app.get('/api/insights', requireAuth, async (req, res) => {
 
 
 
-// // ── GET /api/insights/take-action/:skuId ────────────────────────
-// // Live snapshot for the price-alert modal — not the alert's stale
-// // CurrentValue, but the actual current PP/SP/competitor state, computed
-// // with the exact same formula recommendation_engine.js uses.
+
+
+
+// Add this import near your other requires at the top of api_server.js:
+//   const { loadCategorySettings, getBusinessVars, calculateRecommendedPrice } = require('./recommendation_engine');
+//
+// Then drop this route in near your other /api/insights routes.
+
+// ── GET /api/insights/take-action/:skuId ────────────────────────
+// Live snapshot for the price-alert modal — not the alert's stale
+// CurrentValue, but the actual current PP/SP/competitor state, computed
+// with the exact same formula recommendation_engine.js uses.
 // app.get('/api/insights/take-action/:skuId', requireAuth, async (req, res) => {
 //   const { skuId } = req.params;
 //   let pool;
@@ -830,21 +838,35 @@ app.get('/api/insights', requireAuth, async (req, res) => {
 //     }
 //     const product = productResult.recordset[0];
 
+//     // TOP 1 ORDER BY price, not separate MIN()/MAX() — a split-column
+//     // approach can pair one store's price with a different store's
+//     // timestamp. This way the price, store name, and "as of" timestamp
+//     // are guaranteed to come from the same row.
 //     const competitorResult = await pool.request()
 //       .input('SKU_ID', sql.NVarChar(100), skuId)
 //       .query(`
-//         SELECT MIN(CompetitorPrice) AS LowestCompetitorPrice, MAX(ScrapedAt) AS AsOf
+//         SELECT TOP 1 CompetitorPrice AS LowestCompetitorPrice, StoreName, ScrapedAt AS AsOf
 //         FROM CompetitorPrices
 //         WHERE SKU = @SKU_ID AND CompetitorPrice IS NOT NULL
 //           AND StockStatus IS NOT NULL AND LOWER(StockStatus) <> 'out of stock'
+//         ORDER BY CompetitorPrice ASC
 //       `);
 //     const lowestCompetitorPrice = competitorResult.recordset[0]?.LowestCompetitorPrice ?? null;
+//     const lowestCompetitorStore = competitorResult.recordset[0]?.StoreName ?? null;
 //     const asOf = competitorResult.recordset[0]?.AsOf ?? null;
 
 //     let recommendedSP = null;
+//     let pricingBreakdown = null; // { gstPct, costOfBusinessPct, profitMarginPct }
+
 //     if (product.PP != null) {
 //       const categorySettings = await loadCategorySettings(pool);
 //       const { gst, costOfBusiness, profitMargin } = getBusinessVars(categorySettings, product.Category);
+
+//       pricingBreakdown = {
+//         gstPct: gst * 100,
+//         costOfBusinessPct: costOfBusiness * 100,
+//         profitMarginPct: profitMargin * 100,
+//       };
 
 //       if (lowestCompetitorPrice != null) {
 //         const { recommendedSP: sp } = calculateRecommendedPrice(
@@ -868,7 +890,9 @@ app.get('/api/insights', requireAuth, async (req, res) => {
 //         pp: product.PP != null ? parseFloat(product.PP) : null,
 //         sp: product.SP != null ? parseFloat(product.SP) : null,
 //         recommendedSP,
+//         pricingBreakdown,
 //         lowestCompetitorPrice: lowestCompetitorPrice != null ? parseFloat(lowestCompetitorPrice) : null,
+//         lowestCompetitorStore,
 //         competitorPriceAsOf: asOf,
 //       },
 //     });
@@ -887,15 +911,23 @@ app.get('/api/insights', requireAuth, async (req, res) => {
 
 
 
-// Add this import near your other requires at the top of api_server.js:
-//   const { loadCategorySettings, getBusinessVars, calculateRecommendedPrice } = require('./recommendation_engine');
-//
-// Then drop this route in near your other /api/insights routes.
 
-// ── GET /api/insights/take-action/:skuId ────────────────────────
-// Live snapshot for the price-alert modal — not the alert's stale
-// CurrentValue, but the actual current PP/SP/competitor state, computed
-// with the exact same formula recommendation_engine.js uses.
+// This route already exists in api_server.js — replace it entirely with
+// this version. Three fixes vs. what you have now:
+//   1. Persists the freshly-computed recommendedSP back onto
+//      InternalProducts (via the existing persistRecommendedSP helper),
+//      so /api/push-to-shopify's variance check has a real, current
+//      number instead of a stale/NULL one.
+//   2. Rounds the GST/COB/margin breakdown percentages to 2dp, fixing
+//      the "7.0000001%" floating-point artifact.
+//   3. Rounds the no-competitor-data fallback recommendedSP to whole
+//      rupees, matching the fix in calculateRecommendedPrice().
+//
+// Same import as before, still needed at the top of api_server.js:
+//   const { loadCategorySettings, getBusinessVars, calculateRecommendedPrice } = require('./recommendation_engine');
+// No new import needed for persistRecommendedSP — it's already defined
+// in this same file (api_server.js).
+
 app.get('/api/insights/take-action/:skuId', requireAuth, async (req, res) => {
   const { skuId } = req.params;
   let pool;
@@ -911,10 +943,6 @@ app.get('/api/insights/take-action/:skuId', requireAuth, async (req, res) => {
     }
     const product = productResult.recordset[0];
 
-    // TOP 1 ORDER BY price, not separate MIN()/MAX() — a split-column
-    // approach can pair one store's price with a different store's
-    // timestamp. This way the price, store name, and "as of" timestamp
-    // are guaranteed to come from the same row.
     const competitorResult = await pool.request()
       .input('SKU_ID', sql.NVarChar(100), skuId)
       .query(`
@@ -935,23 +963,31 @@ app.get('/api/insights/take-action/:skuId', requireAuth, async (req, res) => {
       const categorySettings = await loadCategorySettings(pool);
       const { gst, costOfBusiness, profitMargin } = getBusinessVars(categorySettings, product.Category);
 
+      // Round to 2dp here specifically — gst/costOfBusiness/profitMargin
+      // pick up float dust from earlier /100 divisions (0.07 * 100 can
+      // come out as 7.000000000000001), and this is purely a display
+      // value, not used in any further math, so rounding here is safe.
       pricingBreakdown = {
-        gstPct: gst * 100,
-        costOfBusinessPct: costOfBusiness * 100,
-        profitMarginPct: profitMargin * 100,
+        gstPct: Math.round(gst * 10000) / 100,
+        costOfBusinessPct: Math.round(costOfBusiness * 10000) / 100,
+        profitMarginPct: Math.round(profitMargin * 10000) / 100,
       };
 
       if (lowestCompetitorPrice != null) {
         const { recommendedSP: sp } = calculateRecommendedPrice(
           parseFloat(product.PP), parseFloat(lowestCompetitorPrice), gst, costOfBusiness, profitMargin
         );
-        recommendedSP = sp;
+        recommendedSP = sp; // already a whole-rupee integer now that calculateRecommendedPrice uses Math.round
       } else {
-        // No live in-stock competitor price right now — still show the
-        // floor price computed from PP + GST/COB/margin alone.
         const multiplier = 1 + gst + costOfBusiness + profitMargin;
-        recommendedSP = parseFloat((parseFloat(product.PP) * multiplier).toFixed(2));
+        recommendedSP = Math.round(parseFloat(product.PP) * multiplier);
       }
+
+      // Keep InternalProducts.RecommendedSP in sync with what this modal
+      // just showed, so the variance check on push compares against the
+      // right number instead of a stale/NULL one from the last full
+      // engine run.
+      await persistRecommendedSP(pool, [{ SKU_ID: skuId, RecommendedSP: recommendedSP }]);
     }
 
     res.json({
@@ -976,12 +1012,6 @@ app.get('/api/insights/take-action/:skuId', requireAuth, async (req, res) => {
     if (pool) await pool.close();
   }
 });
-
-
-
-
-
-
 
 
 
