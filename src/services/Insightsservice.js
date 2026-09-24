@@ -410,10 +410,6 @@ module.exports = { getInsights, dismissInsight, bulkDismissInsights };
 
 
 
-
-
-
-
 // // src/services/insightsService.js
 // // ─────────────────────────────────────────────────────────────
 // // Computes the 4 "take action" alert types and reconciles them into
@@ -630,12 +626,7 @@ module.exports = { getInsights, dismissInsight, bulkDismissInsights };
 //     `);
 // }
 
-// // ── Main entry point — recompute + reconcile all 4 types,
-// // then return the current active set (optionally filtered). ────
-// async function getInsights(
-//   pool,
-//   { category = null, minThresholdPct = null } = {},
-// ) {
+// async function recomputeAndReconcileAll(pool) {
 //   const defaultThreshold = await getThresholdPct(pool);
 
 //   const [{ lowAlerts, highAlerts }, oosAlerts, noListingAlerts] =
@@ -652,16 +643,51 @@ module.exports = { getInsights, dismissInsight, bulkDismissInsights };
 //   await reconcileAlertType(pool, "OOS", oosAlerts);
 //   await reconcileAlertType(pool, "NO_LISTING", noListingAlerts);
 
-//   // Now read back the current active set. category/minThresholdPct only
-//   // filter what's displayed — minThresholdPct can only narrow ABOVE the
-//   // stored default (you can't see below-2% alerts this way, since those
-//   // were never computed as "active" in the first place).
+//   return defaultThreshold;
+// }
+
+// // ── Main entry point ───────────────────────────────────────────
+// // skipRecompute: true means "just read InsightAlerts as it currently
+// // stands" — no recompute, no MERGE. Use this for filter/sort/pagination
+// // changes on the Insights dashboard, where re-running all 4 alert
+// // computations on every keystroke would be wasteful. Leave it false (the
+// // default) for anything that should reflect the latest scrape data, like
+// // the bell's 5-minute poll or the dashboard's first load.
+// async function getInsights(
+//   pool,
+//   {
+//     category = null,
+//     alertType = null,        // 'LOW_PRICE' | 'HIGH_PRICE' | 'PRICE' (both) | 'OOS' | 'NO_LISTING' | null (all)
+//     search = null,            // matches SKU_ID or Title, partial
+//     sortBy = "newest",        // 'newest' | 'diff'
+//     page = null,              // 1-based; omit page/pageSize entirely to get everything unpaginated (bell's usage)
+//     pageSize = null,
+//     minThresholdPct = null,
+//     skipRecompute = false,
+//   } = {},
+// ) {
+//   const defaultThreshold = skipRecompute
+//     ? await getThresholdPct(pool)
+//     : await recomputeAndReconcileAll(pool);
+
 //   const request = pool.request();
-//   let whereClauses = [`Status = 'active'`];
+//   const whereClauses = [`Status = 'active'`];
 
 //   if (category) {
 //     request.input("Category", sql.NVarChar(200), category);
 //     whereClauses.push("Category = @Category");
+//   }
+//   if (alertType) {
+//     if (alertType === "PRICE") {
+//       whereClauses.push(`AlertType IN ('LOW_PRICE','HIGH_PRICE')`);
+//     } else {
+//       request.input("AlertType", sql.NVarChar(20), alertType);
+//       whereClauses.push("AlertType = @AlertType");
+//     }
+//   }
+//   if (search) {
+//     request.input("Search", sql.NVarChar(200), `%${search}%`);
+//     whereClauses.push("(SKU_ID LIKE @Search OR Title LIKE @Search)");
 //   }
 
 //   const result = await request.query(`
@@ -674,17 +700,48 @@ module.exports = { getInsights, dismissInsight, bulkDismissInsights };
 
 //   let rows = result.recordset;
 
-//   if (minThresholdPct != null && !isNaN(minThresholdPct)) {
-//     rows = rows.filter((r) => {
-//       if (r.AlertType !== "LOW_PRICE" && r.AlertType !== "HIGH_PRICE")
-//         return true; // OOS/NO_LISTING unaffected
+//   // Parse the diff once here so neither the bell nor the dashboard has to
+//   // regex CurrentValue client-side.
+//   for (const r of rows) {
+//     r.DiffPercent = null;
+//     if (r.AlertType === "LOW_PRICE" || r.AlertType === "HIGH_PRICE") {
 //       const match = /diff:(-?\d+(\.\d+)?)/.exec(r.CurrentValue || "");
-//       if (!match) return true;
-//       return Math.abs(parseFloat(match[1])) >= minThresholdPct;
-//     });
+//       if (match) r.DiffPercent = parseFloat(match[1]);
+//     }
 //   }
 
-//   return { data: rows, total: rows.length, defaultThreshold };
+//   if (minThresholdPct != null && !isNaN(minThresholdPct)) {
+//     rows = rows.filter(
+//       (r) => r.DiffPercent == null || Math.abs(r.DiffPercent) >= minThresholdPct,
+//     );
+//   }
+
+//   if (sortBy === "diff") {
+//     rows = [...rows].sort(
+//       (a, b) => Math.abs(b.DiffPercent ?? 0) - Math.abs(a.DiffPercent ?? 0),
+//     );
+//   }
+
+//   const categories = [...new Set(rows.map((r) => r.Category).filter(Boolean))].sort();
+//   const total = rows.length;
+
+//   let paged = rows;
+//   let totalPages = 1;
+//   if (pageSize) {
+//     totalPages = Math.max(1, Math.ceil(total / pageSize));
+//     const start = (Math.max(1, page || 1) - 1) * pageSize;
+//     paged = rows.slice(start, start + pageSize);
+//   }
+
+//   return {
+//     data: paged,
+//     total,
+//     page: page || 1,
+//     pageSize: pageSize || total,
+//     totalPages,
+//     categories,
+//     defaultThreshold,
+//   };
 // }
 
 // // ── Dismiss one alert ──────────────────────────────────────────
@@ -702,4 +759,26 @@ module.exports = { getInsights, dismissInsight, bulkDismissInsights };
 //   return result.recordset[0] || null;
 // }
 
-// module.exports = { getInsights, dismissInsight };
+// // ── Dismiss many alerts at once (the dashboard's "Dismiss selected") ──
+// async function bulkDismissInsights(pool, ids, dismissedBy) {
+//   if (!Array.isArray(ids) || ids.length === 0) return [];
+
+//   const request = pool.request();
+//   const paramNames = ids.map((id, i) => {
+//     const name = `Id${i}`;
+//     request.input(name, sql.Int, id);
+//     return `@${name}`;
+//   });
+//   request.input("DismissedBy", sql.NVarChar(150), dismissedBy);
+
+//   const result = await request.query(`
+//     UPDATE InsightAlerts
+//     SET Status = 'dismissed', DismissedAt = SYSDATETIME(), DismissedBy = @DismissedBy,
+//         SnapshotValue = CurrentValue
+//     OUTPUT INSERTED.Id
+//     WHERE Id IN (${paramNames.join(",")});
+//   `);
+//   return result.recordset.map((r) => r.Id);
+// }
+
+// module.exports = { getInsights, dismissInsight, bulkDismissInsights };
