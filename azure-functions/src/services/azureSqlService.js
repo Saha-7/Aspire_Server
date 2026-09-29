@@ -1,20 +1,35 @@
 // src/services/azureSqlService.js
 // ─────────────────────────────────────────────────────────────
 // CHANGE in this version:
+//   - PP recency is now evaluated PER CATEGORY (CategorySettings.PPLookbackDays)
+//     instead of one global 30-day window. fetchPurchasePrices() takes a
+//     windowDays param (the widest window needed across all categories, used
+//     purely to size the SQL pre-filter), and combineData() takes a
+//     categorySettings map so each row's bill recency is checked against ITS
+//     OWN category's window.
 //   - buildPriceMap now stores { price, date } where date is col_date
 //   - combineData now includes LastBillDate (most recent bill date per SKU)
 //     so internal_db_sync can write it to InternalProducts.
-//   - NEW: fetchShopifyFlagsByCategory(category) — targeted, lightweight
-//     read of just is_enabled/in_stock for one category, used by the
-//     on-demand category-filter sync (no full Zoho+Shopify pull).
-//   - sanitizeSKU is now exported so callers writing back to
+//   - sanitizeSKU is exported so callers writing back to
 //     InternalProducts use the exact same SKU format that was stored.
+//
+// REMOVED:
+//   - fetchShopifyFlagsByCategory(category) — the targeted, lightweight
+//     flags-only read used by the on-demand category-filter sync has
+//     been removed. That sync path no longer exists (isActive/isInStock
+//     are now updated exclusively by the daily 9 AM full sync via
+//     syncInternalProducts / fetchCombinedData).
 // ─────────────────────────────────────────────────────────────
 
 const sql = require('mssql');
 const { AzureCliCredential, ManagedIdentityCredential } = require('@azure/identity');
 
 const { connectWithRetry } = require('../utils/connectWithRetry');
+
+// System-wide fallback used when a category has no PPLookbackDays override
+// (NULL in CategorySettings) — mirrors DEFAULT_GST / DEFAULT_COST_OF_BUSINESS
+// / DEFAULT_PROFIT_MARGIN in recommendation_engine.js.
+const DEFAULT_PP_LOOKBACK_DAYS = 30;
 
 const SERVER     = process.env.db_serverendpoint;
 const DB_ZOHO    = process.env.db_zoho;
@@ -91,24 +106,57 @@ function sanitizeSKU(sku) {
   return sku.replace(/[^\x20-\x7E]/g, '').trim();
 }
 
-// ── Fetch purchase prices from Zoho (last 30 days) ────────────
-async function fetchPurchasePrices() {
-  console.log(`📡 Fetching from ${DB_ZOHO} → vw_Zoho_Bills_Data (last 30 days)...`);
+// ── Fetch purchase prices from Zoho ────────────────────────────
+// windowDays is the WIDEST lookback needed across all categories (see
+// getMaxLookbackDays below) — this is a coarse pre-filter to keep the row
+// count sane. The actual per-category recency check happens in combineData()
+// against each row's own PPLookbackDays, since a single SQL WHERE clause
+// can't vary by category.
+async function fetchPurchasePrices(windowDays = DEFAULT_PP_LOOKBACK_DAYS) {
+  console.log(`📡 Fetching from ${DB_ZOHO} → vw_Zoho_Bills_Data (last ${windowDays} days)...`);
   const accessToken = await getToken('db_zoho_accesstoken');
-  const rows = await queryDB(
-    DB_ZOHO,
-    `SELECT col_Zoho_SKU, col_item_price_per_item, col_date
-     FROM [dbo].[vw_Zoho_Bills_Data]
-     WHERE col_status IN ('paid', 'partially_paid', 'open', 'overdue')
-       AND col_Zoho_SKU IS NOT NULL
-       AND col_date >= DATEADD(DAY, -30, CAST(GETDATE() AS DATE))`,
-    accessToken
-  );
-  console.log(`   ✅ ${rows.length} rows from Zoho (≤30 days old)`);
+  const pool = await connectWithRetry(buildConfig(DB_ZOHO, accessToken), { label: DB_ZOHO });
+  let rows;
+  try {
+    const result = await pool.request()
+      .input('WindowDays', sql.Int, windowDays)
+      .query(`
+        SELECT col_Zoho_SKU, col_item_price_per_item, col_date
+        FROM [dbo].[vw_Zoho_Bills_Data]
+        WHERE col_status IN ('paid', 'partially_paid', 'open', 'overdue')
+          AND col_Zoho_SKU IS NOT NULL
+          AND col_date >= DATEADD(DAY, -@WindowDays, CAST(GETDATE() AS DATE))
+      `);
+    rows = result.recordset;
+  } finally {
+    await pool.close();
+  }
+  console.log(`   ✅ ${rows.length} rows from Zoho (≤${windowDays} days old)`);
   rows.slice(0, 5).forEach(r =>
     console.log(`      → SKU="${r.col_Zoho_SKU}" | Price=${r.col_item_price_per_item} | Date=${r.col_date}`)
   );
   return rows;
+}
+
+// ── Effective PP lookback window for a category, mirroring
+// getBusinessVars() in recommendation_engine.js: NULL/missing override
+// falls back to the system default. ───────────────────────────
+function getEffectivePPLookbackDays(categorySettings, categoryName) {
+  const days = categorySettings?.get(categoryName)?.ppLookbackDays;
+  return days ?? DEFAULT_PP_LOOKBACK_DAYS;
+}
+
+// Widest window across all configured categories (plus the system default,
+// in case a category isn't in CategorySettings yet) — used to size the
+// single Zoho query so every category's own window is covered by it.
+function getMaxLookbackDays(categorySettings) {
+  let max = DEFAULT_PP_LOOKBACK_DAYS;
+  if (categorySettings) {
+    for (const { ppLookbackDays } of categorySettings.values()) {
+      if (ppLookbackDays != null && ppLookbackDays > max) max = ppLookbackDays;
+    }
+  }
+  return Math.min(max, 365);
 }
 
 // ── Fetch SKUs from Shopify ───────────────────────────────────
@@ -127,31 +175,6 @@ async function fetchShopifySKUs() {
     console.log(`      → SKU="${r.sku}" | Title="${r.title}" | is_enabled=${r.is_enabled} | in_stock=${r.in_stock}`)
   );
   return rows;
-}
-
-// ── NEW: targeted flags-only fetch for ONE category ───────────
-// Used by the on-demand category-filter sync. Deliberately narrow —
-// only the 2 columns that matter (is_enabled/in_stock) for the SKUs
-// in this category, not a full Zoho+Shopify pull like fetchCombinedData.
-async function fetchShopifyFlagsByCategory(category) {
-  console.log(`📡 Fetching flags for category "${category}" from vw_Shopify_Product_SKUs...`);
-  const accessToken = await getToken('db_returns_accesstoken');
-
-  let pool;
-  try {
-    pool = await connectWithRetry(buildConfig(DB_RETURNS, accessToken), { label: DB_RETURNS });
-    const result = await pool.request()
-      .input('category', sql.NVarChar(200), category)
-      .query(`
-        SELECT sku, is_enabled, in_stock
-        FROM [dbo].[vw_Shopify_Product_SKUs]
-        WHERE shopify_type_name = @category
-      `);
-    console.log(`   ✅ ${result.recordset.length} rows for category "${category}"`);
-    return result.recordset;
-  } finally {
-    if (pool) await pool.close();
-  }
 }
 
 // ── Build price map — keeps most recent entry per SKU ─────────
@@ -175,46 +198,61 @@ function buildPriceMap(zohoRows) {
     }
   }
 
-  console.log(`   🗺️  Zoho priceMap size: ${priceMap.size} unique SKUs (last 30 days)`);
+  console.log(`   🗺️  Zoho priceMap size: ${priceMap.size} unique SKUs`);
   return priceMap;
 }
 
 // ── Combine Zoho + Shopify ────────────────────────────────────
-// NEW: combined rows now include LastBillDate so the sync can write it.
-function combineData(zohoRows, shopifyRows) {
+// PP recency is now evaluated PER-CATEGORY: categorySettings is the Map
+// built by loadCategorySettings() (internal_db_sync.js), keyed by
+// CategoryName → { ppLookbackDays, ... }. A row's most recent bill only
+// counts toward PP if it falls inside THAT category's window — a category
+// with no override (or not present at all) uses DEFAULT_PP_LOOKBACK_DAYS.
+function combineData(zohoRows, shopifyRows, categorySettings) {
   const priceMap = buildPriceMap(zohoRows);
-  let ppMatched = 0, ppMissed = 0, skusCleaned = 0;
+  const now = new Date();
+  let ppMatched = 0, ppMissed = 0, ppStale = 0, skusCleaned = 0;
 
   const combined = shopifyRows.map(row => {
     const rawSKU   = row.sku ?? null;
     const cleanSKU = sanitizeSKU(rawSKU);
     if (rawSKU && cleanSKU !== rawSKU) skusCleaned++;
 
-    const key   = (cleanSKU || '').toLowerCase();
-    const entry = priceMap.get(key);
-    const pp    = entry ? entry.price : null;
-    // Store the bill date as a plain Date (or null if no recent bill)
+    const category = row.shopify_type_name ?? null;
+    const key       = (cleanSKU || '').toLowerCase();
+    const entry     = priceMap.get(key);
+
+    // Category-specific window — a bill older than this doesn't count.
+    const lookbackDays = getEffectivePPLookbackDays(categorySettings, category);
+    const cutoff = new Date(now);
+    cutoff.setDate(cutoff.getDate() - lookbackDays);
+
+    const withinWindow = entry && entry.date >= cutoff;
+    const pp           = withinWindow ? entry.price : null;
+    // LastBillDate reflects the most recent bill regardless of window
+    // (useful for diagnostics even when it's too old to count toward PP).
     const lastBillDate = entry ? entry.date : null;
 
     if (pp !== null) ppMatched++;
-    else             ppMissed++;
+    else if (entry)  ppStale++;   // had a bill, but outside this category's window
+    else              ppMissed++;
 
     return {
       SKU_ID       : cleanSKU,
       Title        : row.title             ?? null,
       Brand        : row.brand_name        ?? null,
-      Category     : row.shopify_type_name ?? null,
+      Category     : category,
       SP           : row.price             ?? null,
       MRP          : row.compare_at_price  ?? null,
       PP           : pp,
       isActive     : row.is_enabled ? 1 : 0,
       isInStock    : row.in_stock   ? 1 : 0,
-      LastBillDate : lastBillDate,  // NEW — DATE from most recent bill
+      LastBillDate : lastBillDate,
     };
   });
 
   if (skusCleaned > 0) console.log(`   🧹 SKUs sanitized: ${skusCleaned}`);
-  console.log(`   ✅ PP matched : ${ppMatched} | ⚠️  PP missing: ${ppMissed}`);
+  console.log(`   ✅ PP matched : ${ppMatched} | ⏳ Outside category window: ${ppStale} | ⚠️  No bill: ${ppMissed}`);
 
   if (ppMissed > 0) {
     console.log('   🔍 Sample unmatched Shopify SKUs (first 5):');
@@ -227,11 +265,15 @@ function combineData(zohoRows, shopifyRows) {
   return combined;
 }
 
-async function fetchCombinedData() {
+// categorySettings: optional Map from loadCategorySettings() (keyed by
+// CategoryName → { ppLookbackDays, ... }). When omitted, every category
+// falls back to DEFAULT_PP_LOOKBACK_DAYS (same as before this change).
+async function fetchCombinedData(categorySettings) {
   console.log('🔄 Fetching from both SQL views...');
-  const zohoRows    = await fetchPurchasePrices();
+  const windowDays  = getMaxLookbackDays(categorySettings);
+  const zohoRows    = await fetchPurchasePrices(windowDays);
   const shopifyRows = await fetchShopifySKUs();
-  const combined    = combineData(zohoRows, shopifyRows);
+  const combined    = combineData(zohoRows, shopifyRows, categorySettings);
   console.log(`✅ Combined ${combined.length} products`);
   return { zohoRows, shopifyRows, combined };
 }
@@ -248,14 +290,11 @@ function clearTokenTimers() {
 module.exports = {
   fetchPurchasePrices,
   fetchShopifySKUs,
-  fetchShopifyFlagsByCategory,
   fetchCombinedData,
   clearTokenTimers,
   sanitizeSKU,
+  getEffectivePPLookbackDays,
 };
-
-
-
 
 
 
@@ -290,9 +329,18 @@ module.exports = {
 // //   - buildPriceMap now stores { price, date } where date is col_date
 // //   - combineData now includes LastBillDate (most recent bill date per SKU)
 // //     so internal_db_sync can write it to InternalProducts.
+// //   - sanitizeSKU is exported so callers writing back to
+// //     InternalProducts use the exact same SKU format that was stored.
+// //
+// // REMOVED:
+// //   - fetchShopifyFlagsByCategory(category) — the targeted, lightweight
+// //     flags-only read used by the on-demand category-filter sync has
+// //     been removed. That sync path no longer exists (isActive/isInStock
+// //     are now updated exclusively by the daily 9 AM full sync via
+// //     syncInternalProducts / fetchCombinedData). The `mssql` import
+// //     (`sql`) is also removed since this was its only user in this file.
 // // ─────────────────────────────────────────────────────────────
 
-// const sql = require('mssql');
 // const { AzureCliCredential, ManagedIdentityCredential } = require('@azure/identity');
 
 // const { connectWithRetry } = require('../utils/connectWithRetry');
@@ -501,4 +549,10 @@ module.exports = {
 //   }
 // }
 
-// module.exports = { fetchPurchasePrices, fetchShopifySKUs, fetchCombinedData, clearTokenTimers };
+// module.exports = {
+//   fetchPurchasePrices,
+//   fetchShopifySKUs,
+//   fetchCombinedData,
+//   clearTokenTimers,
+//   sanitizeSKU,
+// };

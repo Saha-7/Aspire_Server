@@ -2,7 +2,6 @@
   "name": "price-scraper-v2",
   "version": "2.0.0",
   "description": "Multi-store price scraper using Bright Data Web Unlocker API",
-  "main": "src/scraper.js",
   "scripts": {
     "start": "node src/api_server.js",
     "scrape": "node src/scraper/index.js",
@@ -11,7 +10,9 @@
     "map": "node src/cleanup_mapper.js",
     "sync-internal": "node src/internal_db_sync.js",
     "recommend": "node src/recommendation_engine.js",
-    "api": "node src/api_server.js"
+    "api": "node src/api_server.js",
+    "predeploy": "powershell -ExecutionPolicy Bypass -File ./sync-src.ps1",
+    "deploy": "func azure functionapp publish tpsazurefx-node --javascript"
   },
   "keywords": [],
   "author": "",
@@ -21,6 +22,7 @@
     "@azure/cosmos": "^4.9.3",
     "@azure/identity": "^4.13.1",
     "@azure/msal-node": "^5.2.2",
+    "@azure/storage-blob": "^12.32.0",
     "axios": "^1.18.1",
     "cheerio": "^1.0.0",
     "cors": "^2.8.6",

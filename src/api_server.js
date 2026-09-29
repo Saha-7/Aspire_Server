@@ -399,10 +399,11 @@ async function getNumericSetting(pool, key, fallback) {
 
 // ── GET /api/recommendations ──────────────────────────────────
 app.get('/api/recommendations', async (req, res) => {
+  console.log('RECS ROUTE v2 (brand)');   // temporary
   let pool;
   try {
     pool = await getSqlPool();
-    const result = await pool.request().query(`
+        const result = await pool.request().query(`
       SELECT
         i.SKU_ID,
         i.Title,
@@ -410,6 +411,7 @@ app.get('/api/recommendations', async (req, res) => {
         i.SP,
         i.RecommendedSP,
         i.Category,
+        i.Brand,
         ROUND(
           ((i.RecommendedSP - (i.PP * 1.30)) / (i.PP * 1.30)) * 100,
           2
@@ -433,6 +435,7 @@ app.get('/api/recommendations', async (req, res) => {
     console.log(`✅ /api/recommendations — ${result.recordset.length} rows served`);
     res.json({ success: true, data: result.recordset });
   } catch (err) {
+    console.error('❌ API error:', err.message, '| line:', err.lineNumber);
     console.error('❌ API error:', err.message);
     res.status(500).json({ success: false, error: err.message });
   } finally {
@@ -443,49 +446,6 @@ app.get('/api/recommendations', async (req, res) => {
 
 
 
-
-// ── GET /api/internal-recommendations ─────────────────────────
-// Internal-data-only RecommendedSP — no competitor matching at all.
-// Eligibility: PP available + isActive + isInStock (same filter as
-// loadInternalProducts). Computed live on every request — cheap,
-// deterministic, no job/polling needed.
-// app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
-//   let pool;
-//   try {
-//     pool = await getSqlPool();
-
-//     const categorySettings = await loadCategorySettings(pool);
-//     const internalProducts = await loadInternalProducts(pool);
-
-//     const rows = internalProducts.map(product => {
-//       const { effectivePP, source } = resolveEffectivePP(product);
-//       const { gst, costOfBusiness, profitMargin } = getBusinessVars(categorySettings, product.Category);
-//       const multiplier     = 1 + gst + costOfBusiness + profitMargin;
-//       const recommendedSP  = parseFloat((effectivePP * multiplier).toFixed(2));
-
-//       return {
-//         SKU_ID       : product.SKU_ID,
-//         Title        : product.Title,
-//         Category     : product.Category,
-//         PP           : effectivePP,
-//         PPSource     : source,
-//         SP           : product.SP != null ? parseFloat(product.SP) : null,
-//         RecommendedSP: recommendedSP,
-//         GSTPct       : parseFloat((gst * 100).toFixed(2)),
-//         COBPct       : parseFloat((costOfBusiness * 100).toFixed(2)),
-//         MarginPct    : parseFloat((profitMargin * 100).toFixed(2)),
-//       };
-//     });
-
-//     console.log(`✅ /api/internal-recommendations — ${rows.length} eligible internal products`);
-//     res.json({ success: true, data: rows });
-//   } catch (err) {
-//     console.error('❌ /api/internal-recommendations error:', err.message);
-//     res.status(500).json({ success: false, error: err.message });
-//   } finally {
-//     if (pool) await pool.close();
-//   }
-// });
 
 
 
@@ -539,6 +499,7 @@ app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
         SKU_ID       : product.SKU_ID,
         Title        : product.Title,
         Category     : product.Category,
+        Brand        : product.Brand,
         PP           : effectivePP,
         PPSource     : source,
         SP           : product.SP != null ? parseFloat(product.SP) : null,
@@ -786,9 +747,10 @@ app.get('/api/pp-template-csv', requireAuth, (req, res) => {
 app.get('/api/insights', requireAuth, async (req, res) => {
   try {
     const pool = await getSqlPool();
-    const { category, alertType, search, sortBy, page, pageSize, minThreshold, skipRecompute } = req.query;
+    const { category, brand, alertType, search, sortBy, page, pageSize, minThreshold, skipRecompute } = req.query;
     const result = await getInsights(pool, {
       category: category || null,
+      brand: brand || null,
       alertType: alertType || null,
       search: search || null,
       sortBy: sortBy || 'newest',
