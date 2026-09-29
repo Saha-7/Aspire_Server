@@ -2,7 +2,6 @@
   "name": "price-scraper-v2",
   "version": "2.0.0",
   "description": "Multi-store price scraper using Bright Data Web Unlocker API",
-  "main": "src/scraper.js",
   "scripts": {
     "start": "node src/api_server.js",
     "scrape": "node src/scraper/index.js",
