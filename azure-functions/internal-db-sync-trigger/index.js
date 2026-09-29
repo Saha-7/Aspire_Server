@@ -1,7 +1,6 @@
 'use strict';
 
-require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env') });
-const { syncInternalProducts } = require('../../src/internal_db_sync');
+const { syncInternalProducts } = require('../src/internal_db_sync');
 
 module.exports = async function (context, myTimer) {
   const timeStamp = new Date().toISOString();
