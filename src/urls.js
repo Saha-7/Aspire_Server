@@ -29,6 +29,16 @@ const STORES = [
       { slug: 'cpu-cooler', url: 'https://www.primeabgb.com/buy-online-price-india/cpu-cooler/'},
       { slug: 'pc-case-cabinets', url: 'https://www.primeabgb.com/buy-online-price-india/pc-cases-cabinet/'},
       { slug: 'nas', url: 'https://www.primeabgb.com/buy-online-price-india/network-attached-storage-nas/'},
+
+
+      { slug: 'case-fan', url: 'https://www.primeabgb.com/buy-online-price-india/case-fans/'},
+      { slug: 'mini-pc', url: 'https://www.primeabgb.com/buy-online-price-india/mini-pc/'},
+      { slug: 'ups', url: 'https://www.primeabgb.com/buy-online-price-india/ups/'},
+      { slug: 'thermal-paste', url:'https://www.primeabgb.com/buy-online-price-india/thermal-paste/'},
+      { slug: 'gaming-chair', url:'https://www.primeabgb.com/buy-online-price-india/gaming-chair/'},
+      { slug: 'mouse-pad', url:'https://www.primeabgb.com/buy-online-price-india/mouse-pad/'},
+      { slug: 'office-laptop', url:'https://www.primeabgb.com/buy-online-price-india/laptop/office-laptop/'},
+      { slug: 'gaming-laptop', url:'https://www.primeabgb.com/buy-online-price-india/laptop/gaming-laptop/'}
       
     ],
   },
@@ -51,8 +61,25 @@ const STORES = [
       { slug: 'external-ssd',    url: 'https://mdcomputers.in/catalog/storage/ssd-drive/external-ssd'},
       { slug: 'pen-drives',      url: 'https://mdcomputers.in/catalog/storage/pen-drive'},
       { slug: 'motherboards',    url: 'https://mdcomputers.in/catalog/motherboard' },
+      {slug: 'cabinet', url: 'https://mdcomputers.in/catalog/cabinet'},
 
-    {slug: 'cabinet', url: 'https://mdcomputers.in/catalog/cabinet'},
+      {slug: '', url: ''},
+      {slug: '', url: ''},
+      {slug: '', url: ''},
+      {slug: '', url: ''},
+      {slug: '', url: ''},
+      {slug: '', url: ''},
+      {slug: '', url: ''},
+      {slug: '', url: ''},
+      {slug: '', url: ''},
+      {slug: '', url: ''},
+      {slug: '', url: ''},
+      {slug: '', url: ''},
+      {slug: '', url: ''},
+      {slug: '', url: ''},
+      {slug: '', url: ''},
+      {slug: '', url: ''}
+
     ],
   },
 
