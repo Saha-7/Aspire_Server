@@ -29,6 +29,7 @@ const {
   calculateRecommendedPrice,
   resolveEffectivePP,   // ← NEW
   getBusinessVars,      // ← NEW
+  loadAllInternalProducts
 } = require('./recommendation_engine');
 
 
@@ -464,13 +465,93 @@ app.get('/api/recommendations', async (req, res) => {
 // priority — a SKU should never appear in both).
 // Computed live on every request, and persisted to SQL so the
 // variance check on push has a real value to compare against.
+// app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
+//   let pool;
+//   try {
+//     pool = await getSqlPool();
+
+//     const categorySettings = await loadCategorySettings(pool);
+//     const internalProducts = await loadInternalProducts(pool);
+
+//     // Fetch the set of SKUs that qualify for Competitor Based Recommendation —
+//     // same match condition used in /api/recommendations (valid competitor price,
+//     // competitor not out of stock). Basic Recommendations must exclude these.
+//     const competitorMatchResult = await pool.request().query(`
+//       SELECT DISTINCT SKU
+//       FROM CompetitorPrices
+//       WHERE CompetitorPrice IS NOT NULL
+//         AND LOWER(StockStatus) != 'out of stock'
+//     `);
+//     const competitorMatchedSkus = new Set(
+//       competitorMatchResult.recordset.map(r => (r.SKU || '').trim().toUpperCase())
+//     );
+
+//     const eligibleProducts = internalProducts.filter(
+//       product => !competitorMatchedSkus.has((product.SKU_ID || '').trim().toUpperCase())
+//     );
+
+//     const rows = eligibleProducts.map(product => {
+//       const { effectivePP, source } = resolveEffectivePP(product);
+//       const { gst, costOfBusiness, profitMargin } = getBusinessVars(categorySettings, product.Category);
+//       const multiplier     = 1 + gst + costOfBusiness + profitMargin;
+//       const recommendedSP  = parseFloat((effectivePP * multiplier).toFixed(2));
+
+//       return {
+//         SKU_ID       : product.SKU_ID,
+//         Title        : product.Title,
+//         Category     : product.Category,
+//         Brand        : product.Brand,
+//         PP           : effectivePP,
+//         PPSource     : source,
+//         SP           : product.SP != null ? parseFloat(product.SP) : null,
+//         RecommendedSP: recommendedSP,
+//         GSTPct       : parseFloat((gst * 100).toFixed(2)),
+//         COBPct       : parseFloat((costOfBusiness * 100).toFixed(2)),
+//         MarginPct    : parseFloat((profitMargin * 100).toFixed(2)),
+//       };
+//     });
+
+//     // Persist so the variance check on push has a real value to compare against.
+//     try {
+//       await persistRecommendedSP(pool, rows);
+//     } catch (persistErr) {
+//       console.error('⚠️ Failed to persist RecommendedSP (non-fatal):', persistErr.message);
+//     }
+
+//     console.log(`✅ /api/internal-recommendations — ${rows.length} eligible internal products (excluded ${competitorMatchedSkus.size} competitor-matched SKUs)`);
+//     res.json({ success: true, data: rows });
+//   } catch (err) {
+//     console.error('❌ /api/internal-recommendations error:', err.message);
+//     res.status(500).json({ success: false, error: err.message });
+//   } finally {
+//     if (pool) await pool.close();
+//   }
+// });
+
+
+
+
+
+
+// ── GET /api/internal-recommendations ─────────────────────────
+// Internal-data-only RecommendedSP — no competitor matching at all.
+// Now shows the WHOLE InternalProducts table (active or inactive, PP
+// available or not — same spirit as Purchase Price Update), MINUS any
+// SKU that's eligible for the Competitor Based table (that table has
+// priority — a SKU should never appear in both).
+// Computed live on every request, and persisted to SQL so the
+// variance check on push has a real value to compare against.
 app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
   let pool;
   try {
     pool = await getSqlPool();
 
     const categorySettings = await loadCategorySettings(pool);
-    const internalProducts = await loadInternalProducts(pool);
+    // Basic Recommendations now shows the WHOLE InternalProducts table —
+    // active or inactive, PP available or not — same spirit as Purchase
+    // Price Update. loadInternalProducts() (PP/active/in-stock filtered)
+    // stays reserved for the Competitor Based engine.
+    const internalProducts = await loadAllInternalProducts(pool);
 
     // Fetch the set of SKUs that qualify for Competitor Based Recommendation —
     // same match condition used in /api/recommendations (valid competitor price,
@@ -490,6 +571,27 @@ app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
     );
 
     const rows = eligibleProducts.map(product => {
+      // No PP yet (bill not received / never set) — can't compute a
+      // RecommendedSP. Still show the row (that's the whole point of this
+      // change), just with the price fields null instead of crashing.
+      if (product.PP == null) {
+        return {
+          SKU_ID       : product.SKU_ID,
+          Title        : product.Title,
+          Category     : product.Category,
+          Brand        : product.Brand,
+          isActive     : product.isActive,
+          isInStock    : product.isInStock,
+          PP           : null,
+          PPSource     : null,
+          SP           : product.SP != null ? parseFloat(product.SP) : null,
+          RecommendedSP: null,
+          GSTPct       : null,
+          COBPct       : null,
+          MarginPct    : null,
+        };
+      }
+
       const { effectivePP, source } = resolveEffectivePP(product);
       const { gst, costOfBusiness, profitMargin } = getBusinessVars(categorySettings, product.Category);
       const multiplier     = 1 + gst + costOfBusiness + profitMargin;
@@ -500,6 +602,8 @@ app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
         Title        : product.Title,
         Category     : product.Category,
         Brand        : product.Brand,
+        isActive     : product.isActive,
+        isInStock    : product.isInStock,
         PP           : effectivePP,
         PPSource     : source,
         SP           : product.SP != null ? parseFloat(product.SP) : null,
@@ -526,6 +630,14 @@ app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
     if (pool) await pool.close();
   }
 });
+
+
+
+
+
+
+
+
 
 
 
