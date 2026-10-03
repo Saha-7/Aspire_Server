@@ -83,6 +83,14 @@ app.use(session({
   },
 }));
 
+
+
+
+app.use('/api/sync', require('./routes/syncRoutes'));
+
+
+
+
 // ── GET /auth/login ───────────────────────────────────────────
 app.get('/auth/login', async (req, res) => {
   const authCodeUrlParams = {
