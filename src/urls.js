@@ -212,18 +212,64 @@ const STORES = [
     // { slug: '', url: ''},
     // { slug: '', url: ''},
   ]
+},
+
+
+
+// src/urls.js
+{
+  name: "computechstore",
+  parser: require("./parsers/computechstore"),
+  categories: [
+    { slug: "cpu-processor", url: "https://computechstore.in/product-category/processor/" },
+    { slug: 'motherboard', url: 'https://computechstore.in/product-category/motherboard/'},
+     { slug: 'hdd', url: 'https://computechstore.in/product-category/storage/hard-disk/'},
+     { slug: 'memory-ram', url: 'https://computechstore.in/product-category/memory-ram/'},
+     { slug: 'graphics-card', url: 'https://computechstore.in/product-category/graphics-card/'},
+    { slug: 'ssd', url: 'https://computechstore.in/product-category/storage/ssd/'},
+    { slug: 'cooling-system', url: 'https://computechstore.in/product-category/cooling-system/'},
+    { slug: 'power-supply', url: 'https://computechstore.in/product-category/power-supply/'},
+    { slug: 'laptop', url: 'https://computechstore.in/product-category/laptop/'},
+    { slug: 'mouse', url: 'https://computechstore.in/product-category/mouse/'},
+    { slug: 'keyboards', url: 'https://computechstore.in/product-category/keyboards/'},
+    { slug: 'mouse-pads', url: 'https://computechstore.in/product-category/accessories/mouse-pads/'},
+    { slug: 'headphones', url: 'https://computechstore.in/product-category/headphones/'},
+    { slug: 'game-controllers', url: 'https://computechstore.in/product-category/game-controllers/'},
+    // { slug: '', url: ''},
+    // { slug: '', url: ''},
+  ],
+},
+
+
+// src/urls.js
+{
+  name: "varietyinfotech",
+  parser: require("./parsers/varietyinfotech"),
+  categories: [
+    { slug: "cpu-processor", url: "https://varietyinfotech.com/product-category/processor/" },
+    { slug: 'motherboard', url: 'https://varietyinfotech.com/product-category/motherboard/'},
+    { slug: 'memory-ram', url: 'https://varietyinfotech.com/product-category/memory-ram/'},
+    { slug: 'storage', url: 'https://varietyinfotech.com/product-category/storage/'},
+    { slug: 'graphics-card', url: 'https://varietyinfotech.com/product-category/graphics-card/'},
+    { slug: 'cooling-system', url: 'https://varietyinfotech.com/product-category/cooling-system/'},
+    { slug: 'power-supply', url: 'https://varietyinfotech.com/product-category/power-supply/'},
+    { slug: 'cabinet-case', url: 'https://varietyinfotech.com/product-category/cabinet-case/'},
+    { slug: 'monitor', url: 'https://varietyinfotech.com/product-category/monitor/'},
+    { slug: 'mouse', url: 'https://varietyinfotech.com/product-category/mouse/'},
+    { slug: 'keyboards', url: 'https://varietyinfotech.com/product-category/keyboards/'}
+    //{ slug: '', url: ''},
+    // { slug: '', url: ''},
+    // { slug: '', url: ''},
+    // { slug: '', url: ''},
+    // { slug: '', url: ''},
+    //{ slug: '', url: ''},
+    // { slug: '', url: ''},
+    // { slug: '', url: ''},
+    // { slug: '', url: ''},
+    // { slug: '', url: ''},
+  ],
 }
 
-  // {
-  //   name  : 'elitehubs',
-  //   parser: require('./parsers/elitehubs'),
-  //   categories: [
-  //     {
-  //       slug: 'cpu-processor',
-  //       url : 'https://elitehubs.com/collections/processor'
-  //     },
-  //   ],
-  // },
 ];
 
 module.exports = { STORES };
