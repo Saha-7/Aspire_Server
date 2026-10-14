@@ -11,7 +11,8 @@ require('dotenv').config();
 const { getRecentRuns, getRunDetail, getRunSkuMatches, buildSkuMatchesCsv } = require('./services/scrapeStatsService');
 //
 
-const { pushPriceToShopify } = require('./services/shopifyService'); // add to top imports
+const { pushPriceToShopify, checkShopifyAccess } = require('./services/shopifyService'); // add to top imports
+const { getStockSnapshot, getLocationNames, snapshotToJson, applyStockUpdates } = require('./services/inventoryService');
 
 const express  = require('express');
 const cors     = require('cors');
@@ -849,10 +850,19 @@ app.patch('/api/update-pp', requireAuth, async (req, res) => {
 
 
 // ── GET /api/pp-template-csv ──────────────────────────────────
-app.get('/api/pp-template-csv', requireAuth, (req, res) => {
+// Header = SKU,PP,<one column per Shopify location>. If the locations can't
+// be loaded the template falls back to the plain SKU,PP header.
+app.get('/api/pp-template-csv', requireAuth, async (req, res) => {
+  let header = 'SKU,PP';
+  try {
+    const locations = await getLocationNames();
+    if (locations.length > 0) header += ',' + locations.join(',');
+  } catch (err) {
+    console.error('⚠️ /api/pp-template-csv — could not load locations:', err.message);
+  }
   res.setHeader('Content-Type', 'text/csv');
   res.setHeader('Content-Disposition', 'attachment; filename="pp_update_template.csv"');
-  res.send('SKU,PP\n');
+  res.send(header + '\n');
 });
 
 
@@ -1334,6 +1344,77 @@ app.post('/api/bulk-update-pp', requireAuth, async (req, res) => {
     res.status(500).json({ success: false, error: err.message });
   } finally {
     if (pool) await pool.close();
+  }
+});
+
+
+// ── POST /api/stock-snapshot ──────────────────────────────────
+// Current per-location stock for the given SKUs, read LIVE from Shopify
+// (falls back to the inventory view if Shopify is unreachable - the response
+// says which via data.source). Used by the PP sheet download and by the
+// upload preview.
+app.post('/api/stock-snapshot', requireAuth, async (req, res) => {
+  const { skus } = req.body;
+  if (!Array.isArray(skus) || skus.length === 0) {
+    return res.status(400).json({ success: false, error: 'skus must be a non-empty array' });
+  }
+  if (skus.length > 10000) {
+    return res.status(400).json({ success: false, error: `Too many SKUs (${skus.length}). Maximum 10000.` });
+  }
+  try {
+    const snapshot = await getStockSnapshot(skus);
+    console.log(`✅ /api/stock-snapshot — ${skus.length} SKUs | source=${snapshot.source}`);
+    res.json({ success: true, data: snapshotToJson(snapshot) });
+  } catch (err) {
+    console.error('❌ /api/stock-snapshot error:', err.message, err.stack);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
+// ── POST /api/bulk-update-stock ───────────────────────────────
+// rows: [{ skuId, stock: { "<Location>": "<cell text>" } }]
+// Blank cell = 0. Diffs against live Shopify stock, pushes only the changes
+// to Shopify, and writes each change to InventoryUpdateLog.
+app.post('/api/bulk-update-stock', requireAuth, async (req, res) => {
+  const { rows = [], fileName = '', ppSessionId = null } = req.body;
+
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return res.status(400).json({ success: false, error: 'Nothing to process' });
+  }
+  if (rows.length > 2000) {
+    return res.status(400).json({ success: false, error: `Too many rows (${rows.length}). Maximum 2000 per upload.` });
+  }
+  for (const row of rows) {
+    if (!row.skuId || typeof row.skuId !== 'string' || typeof row.stock !== 'object' || row.stock === null) {
+      return res.status(400).json({ success: false, error: 'Each row must have a skuId string and a stock object' });
+    }
+  }
+
+  const updatedBy = req.session?.user?.email || 'unknown';
+  let pool;
+  try {
+    pool = await getSqlPool();
+    const result = await applyStockUpdates(pool, { rows, updatedBy, ppSessionId, fileName });
+    res.json({ success: true, data: { ...result, updatedBy, updatedAt: new Date().toISOString() } });
+  } catch (err) {
+    console.error('❌ /api/bulk-update-stock error:', err.message, err.stack);
+    res.status(err.status || 500).json({ success: false, error: err.message, details: err.details });
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
+// ── GET /api/shopify-access-check ─────────────────────────────
+// Diagnostic: API version in use, scopes the app really has (write_inventory
+// is needed to set quantities AND to activate a location), and Shopify locations.
+app.get('/api/shopify-access-check', requireAuth, async (req, res) => {
+  try {
+    res.json({ success: true, data: await checkShopifyAccess() });
+  } catch (err) {
+    console.error('❌ /api/shopify-access-check error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -2538,101 +2619,7 @@ app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
 
 
 
-// ── POST /api/push-to-shopify ─────────────────────────────────
-// app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
-//   const { skuId, sp, isManual, confirmVariance } = req.body;
 
-//   if (!skuId || sp == null) {
-//     return res.status(400).json({ success: false, error: 'skuId and sp are required' });
-//   }
-//   const parsedSP = parseFloat(sp);
-//   if (isNaN(parsedSP) || parsedSP <= 0) {
-//     return res.status(400).json({ success: false, error: 'sp must be a positive number' });
-//   }
-
-//   const pushedBy = req.session?.user?.email || 'unknown';
-//   let pool;
-//   try {
-//     pool = await getSqlPool();
-
-//     // ── Variance check — against your own DB, before Shopify is touched at all ──
-//     const checkRow = await pool.request()
-//       .input('SKU_ID', sql.NVarChar(100), skuId)
-//       .query(`SELECT RecommendedSP, SP FROM InternalProducts WHERE SKU_ID = @SKU_ID`); // ← added SP
-
-//     if (!checkRow.recordset.length) {
-//       return res.status(404).json({ success: false, error: `SKU not found: ${skuId}` });
-//     }
-
-//     const currentSP = checkRow.recordset[0].SP; // ← NEW: value before this push, for OldSellingPrice
-//     const systemSPRaw = checkRow.recordset[0].RecommendedSP;
-//     const systemSP = systemSPRaw != null ? parseFloat(systemSPRaw) : null;
-
-//     const VARIANCE_THRESHOLD = await getNumericSetting(pool, 'VARIANCE_THRESHOLD', 0.10);
-//     let variance = 0;
-//     let requiresConfirm = false;
-
-//     if (systemSP === null || isNaN(systemSP) || systemSP <= 0) {
-//       requiresConfirm = true;
-//     } else {
-//       variance = Math.abs(parsedSP - systemSP) / systemSP;
-//       requiresConfirm = variance > VARIANCE_THRESHOLD;
-//     }
-
-//     if (requiresConfirm && !confirmVariance) {
-//       return res.status(422).json({
-//         success: false,
-//         error: 'variance_check_failed',
-//         message: systemSP
-//           ? `Entered SP (₹${parsedSP}) differs from system RecommendedSP (₹${systemSP}) by ${(variance * 100).toFixed(1)}%. Confirm to proceed.`
-//           : `No system-calculated RecommendedSP is stored for this SKU yet — please confirm ₹${parsedSP} is correct before pushing.`,
-//         systemSP,
-//       });
-//     }
-
-//     // Push to Shopify first — don't touch SQL if this fails
-//     await pushPriceToShopify(skuId, parsedSP);
-
-//     const request = pool.request()
-//       .input('SKU_ID',          sql.NVarChar(100),  skuId)
-//       .input('SP',              sql.Decimal(10, 2), parsedSP)
-//       .input('OldSellingPrice', sql.Decimal(10, 2), currentSP) // ← NEW
-//       .input('PushedBy',        sql.NVarChar(150),  pushedBy);
-
-//     let updateQuery = `
-//       UPDATE InternalProducts
-//       SET ShopifyPushedSP = @SP, ShopifyPushedAt = GETDATE(),
-//           ShopifyPushedBy = @PushedBy, ShopifyPushStatus = 'success',
-//           OldSellingPrice = @OldSellingPrice
-//     `;
-//     if (isManual) {
-//       updateQuery += `,
-//           ManualRecommendedSP = @SP, ManualRecommendedSP_UpdatedAt = GETDATE(),
-//           ManualRecommendedSP_UpdatedBy = @PushedBy
-//       `;
-//     }
-//     updateQuery += ` WHERE SKU_ID = @SKU_ID;
-//       SELECT SKU_ID, RecommendedSP, ManualRecommendedSP, ShopifyPushedSP, ShopifyPushedAt, OldSellingPrice
-//       FROM InternalProducts WHERE SKU_ID = @SKU_ID;
-//     `;
-
-//     const result = await request.query(updateQuery);
-
-//     console.log(`✅ Pushed to Shopify: SKU=${skuId} | SP=₹${parsedSP} (was ₹${currentSP ?? 'N/A'}) | By=${pushedBy} | Manual=${!!isManual}`);
-//     res.json({ success: true, data: result.recordset[0] });
-//   } catch (err) {
-//     console.error(`❌ /api/push-to-shopify error for ${skuId}:`, err.message);
-//     try {
-//       const failPool = await getSqlPool();
-//       await failPool.request()
-//         .input('SKU_ID', sql.NVarChar(100), skuId)
-//         .query(`UPDATE InternalProducts SET ShopifyPushStatus = 'failed' WHERE SKU_ID = @SKU_ID`);
-//     } catch (_) {}
-//     res.status(500).json({ success: false, error: err.message });
-//   } finally {
-//     if (pool) await pool.close();
-//   }
-// });
 
 
 
