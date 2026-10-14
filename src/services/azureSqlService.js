@@ -287,9 +287,26 @@ function clearTokenTimers() {
   }
 }
 
+// ── Fetch per-location inventory rows from Shopify view ───────
+// One row per SKU x location. Used to know each SKU's inventory_item_id and
+// location ids (needed for the Shopify push) and as a fallback for quantities.
+async function fetchInventoryViewRows() {
+  console.log(`📡 Fetching from ${DB_RETURNS} → vw_Shopify_Product_SKU_Inventory...`);
+  const accessToken = await getToken('db_returns_accesstoken');
+  const rows = await queryDB(
+    DB_RETURNS,
+    `SELECT location_id, sku, item_id, location_name, quantity
+     FROM [dbo].[vw_Shopify_Product_SKU_Inventory]`,
+    accessToken
+  );
+  console.log(`   ✅ ${rows.length} inventory rows from Shopify view`);
+  return rows;
+}
+
 module.exports = {
   fetchPurchasePrices,
   fetchShopifySKUs,
+  fetchInventoryViewRows,
   fetchCombinedData,
   clearTokenTimers,
   sanitizeSKU,
