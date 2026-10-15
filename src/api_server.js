@@ -67,7 +67,8 @@ app.use(cors({
   origin     : process.env.FRONTEND_URL || 'http://localhost:5173',
   credentials: true,
 }));
-app.use(express.json());
+// Default limit is 100kb - a full-catalog stock export sends ~8,500 SKUs (~130kb).
+app.use(express.json({ limit: '2mb' }));
 
 // Trust proxy — required for secure cookies behind Azure's load balancer
 app.set('trust proxy', 1);
@@ -1362,11 +1363,56 @@ app.post('/api/stock-snapshot', requireAuth, async (req, res) => {
     return res.status(400).json({ success: false, error: `Too many SKUs (${skus.length}). Maximum 10000.` });
   }
   try {
-    const snapshot = await getStockSnapshot(skus);
+    // Live per-item reads are limited by Shopify's API rate limit (and the 230s App Service
+    // request timeout), so big exports use the last-synced DB view instead of live stock.
+    const LIVE_MAX_SKUS = 500;
+    const skipLive = skus.length > LIVE_MAX_SKUS
+      ? `${skus.length} products is too many for a live Shopify read (limit ${LIVE_MAX_SKUS}), so stock is from the last sync`
+      : null;
+    const snapshot = await getStockSnapshot(skus, { skipLive });
     console.log(`✅ /api/stock-snapshot — ${skus.length} SKUs | source=${snapshot.source}`);
     res.json({ success: true, data: snapshotToJson(snapshot) });
   } catch (err) {
     console.error('❌ /api/stock-snapshot error:', err.message, err.stack);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
+// ── GET /api/stock-check?sku=ABC  (or ?sku=A&sku=B) ───────────
+// Debug helper, openable straight in the browser (no Postman needed) while
+// logged in. For each SKU it shows what the DB view says, what Shopify says
+// live, and the final per-location result the sheet would use.
+// NOTE: a "+" inside a SKU must be written as %2B in the URL.
+app.get('/api/stock-check', requireAuth, async (req, res) => {
+  const skus = [].concat(req.query.sku || []).map(s => String(s).trim()).filter(Boolean);
+  if (skus.length === 0 || skus.length > 20) {
+    return res.status(400).json({ success: false, error: 'Pass 1-20 SKUs, e.g. /api/stock-check?sku=YD3200C5FHBOX' });
+  }
+  try {
+    const { fetchInventoryViewRows } = require('./services/azureSqlService');
+    const [snapshot, viewRows] = await Promise.all([getStockSnapshot(skus), fetchInventoryViewRows()]);
+    const wanted = new Set(skus.map(s => s.toLowerCase()));
+    const result = {};
+    for (const sku of skus) result[sku] = { dbView: {}, final: {} };
+    for (const r of viewRows) {
+      const k = String(r.sku || '').trim();
+      if (wanted.has(k.toLowerCase())) {
+        const target = skus.find(x => x.toLowerCase() === k.toLowerCase());
+        result[target].dbView[String(r.location_name).trim()] = Number(r.quantity);
+      }
+    }
+    const json = snapshotToJson(snapshot);
+    for (const sku of skus) result[sku].final = json.stock[sku.toLowerCase()] || {};
+    res.json({
+      success: true,
+      source: json.source,            // 'shopify-live' or 'view-fallback'
+      liveError: json.liveError,      // why live read failed, if it did
+      allLocationColumns: json.locations,
+      skus: result,                   // dbView = DB view rows, final = what the sheet shows (missing location = NA)
+    });
+  } catch (err) {
+    console.error('❌ /api/stock-check error:', err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -1382,8 +1428,8 @@ app.post('/api/bulk-update-stock', requireAuth, async (req, res) => {
   if (!Array.isArray(rows) || rows.length === 0) {
     return res.status(400).json({ success: false, error: 'Nothing to process' });
   }
-  if (rows.length > 2000) {
-    return res.status(400).json({ success: false, error: `Too many rows (${rows.length}). Maximum 2000 per upload.` });
+  if (rows.length > 500) {
+    return res.status(400).json({ success: false, error: `Too many rows (${rows.length}) for a stock update. Maximum 500 per upload (live Shopify stock is read for each).` });
   }
   for (const row of rows) {
     if (!row.skuId || typeof row.skuId !== 'string' || typeof row.stock !== 'object' || row.stock === null) {
@@ -2619,7 +2665,101 @@ app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
 
 
 
+// ── POST /api/push-to-shopify ─────────────────────────────────
+// app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
+//   const { skuId, sp, isManual, confirmVariance } = req.body;
 
+//   if (!skuId || sp == null) {
+//     return res.status(400).json({ success: false, error: 'skuId and sp are required' });
+//   }
+//   const parsedSP = parseFloat(sp);
+//   if (isNaN(parsedSP) || parsedSP <= 0) {
+//     return res.status(400).json({ success: false, error: 'sp must be a positive number' });
+//   }
+
+//   const pushedBy = req.session?.user?.email || 'unknown';
+//   let pool;
+//   try {
+//     pool = await getSqlPool();
+
+//     // ── Variance check — against your own DB, before Shopify is touched at all ──
+//     const checkRow = await pool.request()
+//       .input('SKU_ID', sql.NVarChar(100), skuId)
+//       .query(`SELECT RecommendedSP, SP FROM InternalProducts WHERE SKU_ID = @SKU_ID`); // ← added SP
+
+//     if (!checkRow.recordset.length) {
+//       return res.status(404).json({ success: false, error: `SKU not found: ${skuId}` });
+//     }
+
+//     const currentSP = checkRow.recordset[0].SP; // ← NEW: value before this push, for OldSellingPrice
+//     const systemSPRaw = checkRow.recordset[0].RecommendedSP;
+//     const systemSP = systemSPRaw != null ? parseFloat(systemSPRaw) : null;
+
+//     const VARIANCE_THRESHOLD = await getNumericSetting(pool, 'VARIANCE_THRESHOLD', 0.10);
+//     let variance = 0;
+//     let requiresConfirm = false;
+
+//     if (systemSP === null || isNaN(systemSP) || systemSP <= 0) {
+//       requiresConfirm = true;
+//     } else {
+//       variance = Math.abs(parsedSP - systemSP) / systemSP;
+//       requiresConfirm = variance > VARIANCE_THRESHOLD;
+//     }
+
+//     if (requiresConfirm && !confirmVariance) {
+//       return res.status(422).json({
+//         success: false,
+//         error: 'variance_check_failed',
+//         message: systemSP
+//           ? `Entered SP (₹${parsedSP}) differs from system RecommendedSP (₹${systemSP}) by ${(variance * 100).toFixed(1)}%. Confirm to proceed.`
+//           : `No system-calculated RecommendedSP is stored for this SKU yet — please confirm ₹${parsedSP} is correct before pushing.`,
+//         systemSP,
+//       });
+//     }
+
+//     // Push to Shopify first — don't touch SQL if this fails
+//     await pushPriceToShopify(skuId, parsedSP);
+
+//     const request = pool.request()
+//       .input('SKU_ID',          sql.NVarChar(100),  skuId)
+//       .input('SP',              sql.Decimal(10, 2), parsedSP)
+//       .input('OldSellingPrice', sql.Decimal(10, 2), currentSP) // ← NEW
+//       .input('PushedBy',        sql.NVarChar(150),  pushedBy);
+
+//     let updateQuery = `
+//       UPDATE InternalProducts
+//       SET ShopifyPushedSP = @SP, ShopifyPushedAt = GETDATE(),
+//           ShopifyPushedBy = @PushedBy, ShopifyPushStatus = 'success',
+//           OldSellingPrice = @OldSellingPrice
+//     `;
+//     if (isManual) {
+//       updateQuery += `,
+//           ManualRecommendedSP = @SP, ManualRecommendedSP_UpdatedAt = GETDATE(),
+//           ManualRecommendedSP_UpdatedBy = @PushedBy
+//       `;
+//     }
+//     updateQuery += ` WHERE SKU_ID = @SKU_ID;
+//       SELECT SKU_ID, RecommendedSP, ManualRecommendedSP, ShopifyPushedSP, ShopifyPushedAt, OldSellingPrice
+//       FROM InternalProducts WHERE SKU_ID = @SKU_ID;
+//     `;
+
+//     const result = await request.query(updateQuery);
+
+//     console.log(`✅ Pushed to Shopify: SKU=${skuId} | SP=₹${parsedSP} (was ₹${currentSP ?? 'N/A'}) | By=${pushedBy} | Manual=${!!isManual}`);
+//     res.json({ success: true, data: result.recordset[0] });
+//   } catch (err) {
+//     console.error(`❌ /api/push-to-shopify error for ${skuId}:`, err.message);
+//     try {
+//       const failPool = await getSqlPool();
+//       await failPool.request()
+//         .input('SKU_ID', sql.NVarChar(100), skuId)
+//         .query(`UPDATE InternalProducts SET ShopifyPushStatus = 'failed' WHERE SKU_ID = @SKU_ID`);
+//     } catch (_) {}
+//     res.status(500).json({ success: false, error: err.message });
+//   } finally {
+//     if (pool) await pool.close();
+//   }
+// });
 
 
 
@@ -2629,6 +2769,10 @@ app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
 // error logging — after all routes
 app.use((err, req, res, next) => {
   log('ERROR', 'app.js', 'errorHandler', err.stack || err.message);
+  // 4xx raised by middleware (e.g. "request entity too large") keeps its real status and message
+  if (err && err.status >= 400 && err.status < 500) {
+    return res.status(err.status).json({ success: false, error: err.message });
+  }
   res.status(500).json({ error: 'Internal Server Error' });
 });
 
