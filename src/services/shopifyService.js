@@ -220,19 +220,21 @@ async function fetchShopifyLocations() {
 // Throws if Shopify returns userErrors (the whole batch is rejected in that case).
 async function setInventoryQuantities(quantities, sessionId) {
   const mutation = INVENTORY_NEEDS_IDEMPOTENCY
-    ? `mutation setQty($input: InventorySetQuantitiesInput!, $key: String!) @idempotent(key: $key) {
-         inventorySetQuantities(input: $input) { userErrors { field message code } }
+    ? `mutation setQty($input: InventorySetQuantitiesInput!, $key: String!) {
+         inventorySetQuantities(input: $input) @idempotent(key: $key) { userErrors { field message code } }
        }`
     : `mutation setQty($input: InventorySetQuantitiesInput!) {
          inventorySetQuantities(input: $input) { userErrors { field message code } }
        }`;
+  // API 2026-04+ : `ignoreCompareQuantity` no longer exists. Each quantity must carry
+  // `changeFromQuantity` explicitly; null = skip the compare-and-swap check (the sheet is the
+  // source of truth for these counts).
   const variables = {
     input: {
       name: 'available',
       reason: 'correction',
-      ignoreCompareQuantity: true,
       referenceDocumentUri: `gid://aspire/BulkStockUpload/${sessionId}`,
-      quantities,
+      quantities: quantities.map(q => ({ ...q, changeFromQuantity: null })),
     },
   };
   if (INVENTORY_NEEDS_IDEMPOTENCY) variables.key = require('crypto').randomUUID();

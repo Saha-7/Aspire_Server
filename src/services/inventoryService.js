@@ -17,19 +17,17 @@
 //
 // Sheet cell rules (per location column):
 //   location ACTIVE   + number n      → set quantity to n (skip if unchanged)
-//   location ACTIVE   + blank         → set quantity to 0 (unless ALL location cells of the row are blank → row's stock untouched)
+//   ANY location      + blank         → no action (active or inactive)
+//   location ACTIVE   + 0             → stock set to 0 (this is the only way to zero a location)
 //   location ACTIVE   + NA            → rejected (deactivating is not supported)
-//   location INACTIVE + number n >= 0 → ACTIVATE the location, then set n
-//   location INACTIVE + NA or blank   → nothing (stays inactive)
+//   location INACTIVE + number        → rejected: locations are activated in Shopify only, never from the sheet
+//   location INACTIVE + NA            → nothing (stays inactive)
 //   negative numbers can only stay as they are (unchanged); new negatives are rejected
 // ─────────────────────────────────────────────────────────────
 const sql = require('mssql');
 const { v4: uuidv4 } = require('uuid');
 const { fetchInventoryViewRows } = require('./azureSqlService');
-const {
-  fetchLiveInventoryLevels, fetchShopifyLocations, setInventoryQuantities,
-  activateInventoryLevel, lookupInventoryItemIdBySku,
-} = require('./shopifyService');
+const { fetchLiveInventoryLevels, fetchShopifyLocations, setInventoryQuantities } = require('./shopifyService');
 const { log } = require('../../blobLogger');
 
 const PUSH_BATCH_SIZE = 100;
@@ -62,7 +60,8 @@ function httpError(status, message, extra = {}) {
 //   items: Map<skuKey, { sku, itemId, levels: Map<locKey, { locationName, locationId, itemId, qty }> }>
 // }
 // Every requested SKU gets an item entry, even if it has no active location.
-async function getStockSnapshot(skus = null, { requireLive = false } = {}) {
+// skipLive: a reason string → don't call Shopify per item, use the view's quantities (large exports).
+async function getStockSnapshot(skus = null, { requireLive = false, skipLive = null } = {}) {
   const viewRows = await fetchInventoryViewRows();
   const wanted   = skus ? new Set(skus.map(key)) : null;
 
@@ -115,7 +114,11 @@ async function getStockSnapshot(skus = null, { requireLive = false } = {}) {
 
   // Live overlay: quantity + active/inactive status straight from Shopify.
   let source = 'shopify-live';
-  try {
+  let liveError = null;
+  if (skipLive) {
+    source = 'view-fallback';
+    liveError = skipLive;
+  } else try {
     const itemIds = [...new Set([...items.values()].map(it => it.itemId).filter(Boolean))];
     const live = await fetchLiveInventoryLevels(itemIds);
     for (const it of items.values()) {
@@ -130,12 +133,15 @@ async function getStockSnapshot(skus = null, { requireLive = false } = {}) {
     }
   } catch (err) {
     log('ERROR', 'inventoryService.js', 'getStockSnapshot', `Live Shopify read failed: ${err.message}`);
-    if (requireLive) throw httpError(502, `Could not read live stock from Shopify: ${err.message}`);
+    if (requireLive) {
+      throw httpError(502, 'Current stock could not be read from Shopify right now, so nothing was changed. Please try again in a few minutes. If it keeps happening, contact the tech team.', { technical: err.message });
+    }
     source = 'view-fallback';
+    liveError = err.message;
   }
 
   const locations = [...locationIds.values()].map(l => l.name).sort((a, b) => a.localeCompare(b));
-  return { source, locations, locationIds, items };
+  return { source, liveError, locations, locationIds, items };
 }
 
 // Plain-JSON version for the API. stock[skuLower][location] exists ONLY for
@@ -146,7 +152,7 @@ function snapshotToJson(snapshot) {
     stock[skuKey] = {};
     for (const lv of it.levels.values()) stock[skuKey][lv.locationName] = lv.qty;
   }
-  return { source: snapshot.source, locations: snapshot.locations, stock };
+  return { source: snapshot.source, liveError: snapshot.liveError || null, locations: snapshot.locations, stock };
 }
 
 // Location names only - for the blank template header.
@@ -170,26 +176,45 @@ function parseCell(raw) {
   if (s === '') return { kind: 'blank' };
   if (/^(na|n\/a)$/i.test(s)) return { kind: 'na' };
   if (/^-?\d+$/.test(s)) return { kind: 'qty', qty: parseInt(s, 10) };
-  return { error: `"${s}" must be a whole number, 0, or NA` };
+  return { error: `"${s}" is not valid. Use a whole number like 0, 5 or 12, or leave the cell blank.` };
 }
 
 // level = current active level for this SKU/location, or undefined (inactive).
 // → { action: 'none' } | { action: 'set'|'activate', newQty } | { error }
 function decideCell(parsed, level) {
   if (parsed.error) return { error: parsed.error };
+  if (parsed.kind === 'blank') return { action: 'none' };   // blank = no action, active or inactive
 
   if (level) {
-    if (parsed.kind === 'na') return { error: 'Location is active - NA cannot be used to deactivate it (use 0 for no stock)' };
-    const newQty = parsed.kind === 'blank' ? 0 : parsed.qty;
-    if (newQty === level.qty) return { action: 'none' };
-    if (newQty < 0)           return { error: 'Negative stock cannot be entered' };
-    return { action: 'set', newQty };
+    if (parsed.kind === 'na') return { error: 'This SKU is active at this location, so NA cannot be used. NA would mean switching the location off, which cannot be done from this sheet. Type 0 if there is no stock, or leave the cell blank for no change.' };
+    if (parsed.qty === level.qty) return { action: 'none' };
+    if (parsed.qty < 0)           return { error: 'Stock cannot be set to a negative number. Use 0 or a positive number.' };
+    return { action: 'set', newQty: parsed.qty };
   }
 
-  // inactive location
-  if (parsed.kind === 'na' || parsed.kind === 'blank') return { action: 'none' };
-  if (parsed.qty < 0) return { error: 'Cannot activate a location with negative stock' };
-  return { action: 'activate', newQty: parsed.qty };
+  // inactive location - locations are activated in Shopify only, never from the sheet
+  if (parsed.kind === 'na') return { action: 'none' };
+  return { error: 'This SKU is not active at this location in Shopify, so stock cannot be added here. Ask the Shopify team to activate the location for this SKU first, then upload again. Or leave the cell blank or NA.' };
+}
+
+// Plain-language version of a Shopify/technical error for the people using the sheet.
+// The raw text is still returned separately as "technical" for the tech team.
+function friendlyShopifyMessage(raw) {
+  const m = String(raw || '');
+  // Problems in our own request (software side) - checked first so they are never mistaken for data problems
+  if (/INVALID_VARIABLE|directiveCannotBeApplied|undefinedField|argumentLiteralsIncompatible|Field is not defined|doesn't exist on type|Variable \$/i.test(m))
+    return 'The app sent Shopify a request that Shopify did not accept. This is a software problem, not a problem with your file or your data. Please contact the tech team and share the technical details.';
+  if (/ACCESS_DENIED|access denied/i.test(m))
+    return 'The app does not have permission to change stock in Shopify. Please contact the tech team.';
+  if (/THROTTLED|throttle|too many requests|429/i.test(m))
+    return 'Shopify is busy right now. Please wait a minute and upload the same file again.';
+  if (/CHANGE_FROM_QUANTITY_STALE|stale/i.test(m))
+    return 'The stock changed in Shopify while you were uploading (for example a sale). Please download a fresh file and try again.';
+  if (/not stocked|is not stocked/i.test(m))
+    return 'Shopify says this SKU is not stocked at this location. Check that the location is active for this SKU in Shopify.';
+  if (/timeout|ETIMEDOUT|ECONNRESET|ENOTFOUND|network|socket/i.test(m))
+    return 'Could not reach Shopify. Please try again in a few minutes.';
+  return 'Shopify could not update this stock. Please try again. If it keeps failing, send the technical details to the tech team.';
 }
 
 // ── Apply an upload ───────────────────────────────────────────
@@ -213,9 +238,6 @@ async function applyStockUpdates(pool, { rows, updatedBy, ppSessionId = null, fi
 
   for (const r of rows) {
     const item = snapshot.items.get(key(r.skuId));
-    // Every location cell blank = this row's stock was not touched (nothing is zeroed).
-    const cells = Object.values(r.stock || {});
-    if (cells.every(v => String(v ?? '').trim() === '')) continue;
     for (const [header, raw] of Object.entries(r.stock || {})) {
       const loc     = snapshot.locationIds.get(key(header));
       const level   = item.levels.get(key(header));
@@ -229,8 +251,8 @@ async function applyStockUpdates(pool, { rows, updatedBy, ppSessionId = null, fi
         action:       decided.action,
         locationName: loc.name,
         locationId:   loc.id,
-        itemId:       level ? level.itemId : null, // resolved below for activations
-        oldQty:       level ? level.qty : null,
+        itemId:       level.itemId,
+        oldQty:       level.qty,
         newQty:       decided.newQty,
         status:       'Pending',
         error:        null,
@@ -242,7 +264,7 @@ async function applyStockUpdates(pool, { rows, updatedBy, ppSessionId = null, fi
     throw httpError(400, `${invalid.length} invalid stock cell(s). Nothing was pushed.`, { details: invalid.slice(0, 50) });
   }
 
-  // 3a) Quantity changes at active locations - batched; if a batch is rejected,
+  // 3) Quantity changes at active locations - batched; if a batch is rejected,
   //     retry its entries one by one so only the genuinely bad ones fail.
   const toQty = (c) => ({ inventoryItemId: c.itemId, locationId: c.locationId, quantity: c.newQty });
   const sets  = changes.filter(c => c.action === 'set');
@@ -264,29 +286,6 @@ async function applyStockUpdates(pool, { rows, updatedBy, ppSessionId = null, fi
     }
   }
 
-  // 3b) Activations (NA → active), one at a time: activate, then set quantity.
-  for (const c of changes.filter(x => x.action === 'activate')) {
-    try {
-      c.itemId = c.itemId
-        || c.item.itemId                                  // item id known from the view / live read
-        || await lookupInventoryItemIdBySku(c.sku);      // SKU not active anywhere yet
-      if (!c.itemId) throw new Error('SKU not found in Shopify inventory');
-
-      await activateInventoryLevel(c.itemId, c.locationId);
-      if (c.newQty !== 0) {
-        try {
-          await setInventoryQuantities([toQty(c)], sessionId);
-        } catch (e) {
-          throw new Error(`Location activated but quantity not set: ${e.message}`);
-        }
-      }
-      c.status = 'Pushed';
-    } catch (e) {
-      c.status = 'Failed';
-      c.error  = String(e.message).slice(0, 1000);
-    }
-  }
-
   // 4) Audit log - one row per changed cell. A logging failure must not hide
   //    the push result, so it is reported as a warning instead of thrown.
   let logWarning = null;
@@ -298,18 +297,16 @@ async function applyStockUpdates(pool, { rows, updatedBy, ppSessionId = null, fi
   }
 
   const pushed    = changes.filter(c => c.status === 'Pushed').length;
-  const activated = changes.filter(c => c.status === 'Pushed' && c.action === 'activate').length;
   const failures  = changes.filter(c => c.status === 'Failed')
-    .map(c => ({ sku: c.sku, location: c.locationName, error: c.error }));
+    .map(c => ({ sku: c.sku, location: c.locationName, error: friendlyShopifyMessage(c.error), technical: c.error }));
 
   log('INFO', 'inventoryService.js', 'applyStockUpdates',
-    `session=${sessionId} | changed=${changes.length} pushed=${pushed} activated=${activated} failed=${failures.length} unchanged=${unchanged} | by=${updatedBy}`);
+    `session=${sessionId} | changed=${changes.length} pushed=${pushed} failed=${failures.length} unchanged=${unchanged} | by=${updatedBy}`);
 
   return {
     sessionId,
     changed: changes.length,
     pushed,
-    activated,
     failed: failures.length,
     unchanged,
     failures,
@@ -333,7 +330,7 @@ async function writeInventoryLog(pool, { sessionId, ppSessionId, fileName, updat
       req.input(`ln${n}`,   sql.NVarChar(100),  c.locationName);
       req.input(`lid${n}`,  sql.NVarChar(100),  c.locationId);
       req.input(`iid${n}`,  sql.NVarChar(100),  c.itemId || '');
-      req.input(`act${n}`,  sql.NVarChar(10),   c.action === 'activate' ? 'Activate' : 'Set');
+      req.input(`act${n}`,  sql.NVarChar(10),   'Set');
       req.input(`old${n}`,  sql.Int,            c.oldQty);
       req.input(`new${n}`,  sql.Int,            c.newQty);
       req.input(`st${n}`,   sql.NVarChar(20),   c.status);

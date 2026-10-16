@@ -744,34 +744,7 @@ app.get('/api/competitor-details/:skuId', async (req, res) => {
 });
 
 
-// // ── GET /api/pp-products ──────────────────────────────────────
-// app.get('/api/pp-products', requireAuth, async (req, res) => {
-//   let pool;
-//   try {
-//     pool = await getSqlPool();
-//     const result = await pool.request().query(`
-//       SELECT
-//         SKU_ID, Title, Category, Brand, PP,
-//         LastBillDate, ManualPP_UpdatedAt, ManualPP_UpdatedBy,
-//         CASE
-//           WHEN ManualPP_UpdatedAt IS NOT NULL AND LastBillDate IS NOT NULL
-//            AND ManualPP_UpdatedAt >= CAST(LastBillDate AS DATETIME2) THEN 'manual'
-//           WHEN ManualPP_UpdatedAt IS NOT NULL AND LastBillDate IS NULL THEN 'manual'
-//           ELSE 'bill'
-//         END AS PPSource
-//       FROM InternalProducts
-//       WHERE isActive = 1
-//       ORDER BY Category, Title
-//     `);
-//     console.log(`✅ /api/pp-products — ${result.recordset.length} rows`);
-//     res.json({ success: true, data: result.recordset });
-//   } catch (err) {
-//     console.error('❌ /api/pp-products error:', err.message);
-//     res.status(500).json({ success: false, error: err.message });
-//   } finally {
-//     if (pool) await pool.close();
-//   }
-// });
+
 
 
 
@@ -914,132 +887,7 @@ app.get('/api/insights', requireAuth, async (req, res) => {
 
 
 
-// This route already exists in api_server.js — replace it entirely with
-// this version. Three fixes vs. what you have now:
-//   1. Persists the freshly-computed recommendedSP back onto
-//      InternalProducts (via the existing persistRecommendedSP helper),
-//      so /api/push-to-shopify's variance check has a real, current
-//      number instead of a stale/NULL one.
-//   2. Rounds the GST/COB/margin breakdown percentages to 2dp, fixing
-//      the "7.0000001%" floating-point artifact.
-//   3. Rounds the no-competitor-data fallback recommendedSP to whole
-//      rupees, matching the fix in calculateRecommendedPrice().
-//
-// Same import as before, still needed at the top of api_server.js:
-//   const { loadCategorySettings, getBusinessVars, calculateRecommendedPrice } = require('./recommendation_engine');
-// No new import needed for persistRecommendedSP — it's already defined
-// in this same file (api_server.js).
 
-// app.get('/api/insights/take-action/:skuId', requireAuth, async (req, res) => {
-//   const { skuId } = req.params;
-//   let pool;
-//   try {
-//     pool = await getSqlPool();
-
-//     const productResult = await pool.request()
-//       .input('SKU_ID', sql.NVarChar(100), skuId)
-//       .query(`SELECT SKU_ID, Title, Category, PP, SP FROM InternalProducts WHERE SKU_ID = @SKU_ID`);
-
-//     if (!productResult.recordset.length) {
-//       return res.status(404).json({ success: false, error: `SKU not found: ${skuId}` });
-//     }
-//     const product = productResult.recordset[0];
-
-//     const competitorResult = await pool.request()
-//       .input('SKU_ID', sql.NVarChar(100), skuId)
-//       .query(`
-//         SELECT TOP 1 CompetitorPrice AS LowestCompetitorPrice, StoreName, ScrapedAt AS AsOf
-//         FROM CompetitorPrices
-//         WHERE SKU = @SKU_ID AND CompetitorPrice IS NOT NULL
-//           AND StockStatus IS NOT NULL AND LOWER(StockStatus) <> 'out of stock'
-//         ORDER BY CompetitorPrice ASC
-//       `);
-//     const lowestCompetitorPrice = competitorResult.recordset[0]?.LowestCompetitorPrice ?? null;
-//     const lowestCompetitorStore = competitorResult.recordset[0]?.StoreName ?? null;
-//     const asOf = competitorResult.recordset[0]?.AsOf ?? null;
-
-//     let recommendedSP = null;
-//     let pricingBreakdown = null; // { gstPct, costOfBusinessPct, profitMarginPct }
-
-//     if (product.PP != null) {
-//       const categorySettings = await loadCategorySettings(pool);
-//       const { gst, costOfBusiness, profitMargin } = getBusinessVars(categorySettings, product.Category);
-
-//       // Round to 2dp here specifically — gst/costOfBusiness/profitMargin
-//       // pick up float dust from earlier /100 divisions (0.07 * 100 can
-//       // come out as 7.000000000000001), and this is purely a display
-//       // value, not used in any further math, so rounding here is safe.
-//       pricingBreakdown = {
-//         gstPct: Math.round(gst * 10000) / 100,
-//         costOfBusinessPct: Math.round(costOfBusiness * 10000) / 100,
-//         profitMarginPct: Math.round(profitMargin * 10000) / 100,
-//       };
-
-//       if (lowestCompetitorPrice != null) {
-//         const { recommendedSP: sp } = calculateRecommendedPrice(
-//           parseFloat(product.PP), parseFloat(lowestCompetitorPrice), gst, costOfBusiness, profitMargin
-//         );
-//         recommendedSP = sp; // already a whole-rupee integer now that calculateRecommendedPrice uses Math.round
-//       } else {
-//         const multiplier = 1 + gst + costOfBusiness + profitMargin;
-//         recommendedSP = Math.round(parseFloat(product.PP) * multiplier);
-//       }
-
-//       // Keep InternalProducts.RecommendedSP in sync with what this modal
-//       // just showed, so the variance check on push compares against the
-//       // right number instead of a stale/NULL one from the last full
-//       // engine run.
-//       await persistRecommendedSP(pool, [{ SKU_ID: skuId, RecommendedSP: recommendedSP }]);
-//     }
-
-//     res.json({
-//       success: true,
-//       data: {
-//         skuId: product.SKU_ID,
-//         title: product.Title,
-//         category: product.Category,
-//         pp: product.PP != null ? parseFloat(product.PP) : null,
-//         sp: product.SP != null ? parseFloat(product.SP) : null,
-//         recommendedSP,
-//         pricingBreakdown,
-//         lowestCompetitorPrice: lowestCompetitorPrice != null ? parseFloat(lowestCompetitorPrice) : null,
-//         lowestCompetitorStore,
-//         competitorPriceAsOf: asOf,
-//       },
-//     });
-//   } catch (err) {
-//     console.error(`❌ /api/insights/take-action/${skuId} error:`, err.message);
-//     res.status(500).json({ success: false, error: err.message });
-//   } finally {
-//     if (pool) await pool.close();
-//   }
-// });
-
-
-
-
-
-
-
-
-
-
-
-// This route already exists in api_server.js — replace it entirely with
-// this version. Three fixes vs. what you have now:
-//   1. Persists the freshly-computed recommendedSP back onto
-//      InternalProducts (via the existing persistRecommendedSP helper),
-//      so /api/push-to-shopify's variance check has a real, current
-//      number instead of a stale/NULL one.
-//   2. Rounds the GST/COB/margin breakdown percentages to 2dp, fixing
-//      the "7.0000001%" floating-point artifact.
-//   3. Rounds the no-competitor-data fallback recommendedSP to whole
-//      rupees, matching the fix in calculateRecommendedPrice().
-//
-// Same import as before, still needed at the top of api_server.js:
-//   const { loadCategorySettings, getBusinessVars, calculateRecommendedPrice } = require('./recommendation_engine');
-// No new import needed for persistRecommendedSP — it's already defined
-// in this same file (api_server.js).
 
 app.get('/api/insights/take-action/:skuId', requireAuth, async (req, res) => {
   const { skuId } = req.params;
@@ -1374,7 +1222,11 @@ app.post('/api/stock-snapshot', requireAuth, async (req, res) => {
     res.json({ success: true, data: snapshotToJson(snapshot) });
   } catch (err) {
     console.error('❌ /api/stock-snapshot error:', err.message, err.stack);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({
+      success: false,
+      error: 'Current stock could not be loaded right now. Please try again in a few minutes. If it keeps happening, contact the tech team.',
+      technical: err.message,
+    });
   }
 });
 
@@ -1445,7 +1297,13 @@ app.post('/api/bulk-update-stock', requireAuth, async (req, res) => {
     res.json({ success: true, data: { ...result, updatedBy, updatedAt: new Date().toISOString() } });
   } catch (err) {
     console.error('❌ /api/bulk-update-stock error:', err.message, err.stack);
-    res.status(err.status || 500).json({ success: false, error: err.message, details: err.details });
+    const known = (err.status && err.status < 500) || err.status === 502;
+    res.status(err.status || 500).json({
+      success: false,
+      error: known ? err.message : 'Something went wrong while updating stock, so nothing was changed. Please try again. If it keeps happening, contact the tech team.',
+      technical: err.technical || (known ? undefined : err.message),
+      details: err.details,
+    });
   } finally {
     if (pool) await pool.close();
   }
@@ -1657,43 +1515,7 @@ app.get('/api/category-settings', requireAuth, async (req, res) => {
 
 
 
-// app.get('/api/category-settings', requireAuth, async (req, res) => {
-//   let pool;
-//   try {
-//     pool = await getSqlPool();
-//     const result = await pool.request().query(`
-//       SELECT
-//         cs.CategoryName,
-//         cs.GST,
-//         cs.CostOfBusiness,
-//         cs.ProfitMargin,
-//         cs.ScrapFreqDays,
-//         cs.IsScrapEnabled,
-//         cs.UpdatedAt,
-//         cs.UpdatedBy,
-//         MAX(ip.LastScrapedAt) AS LastScrapedAt
-//       FROM CategorySettings cs
-//       LEFT JOIN InternalProducts ip ON ip.Category = cs.CategoryName
-//       GROUP BY
-//         cs.CategoryName,
-//         cs.GST,
-//         cs.CostOfBusiness,
-//         cs.ProfitMargin,
-//         cs.ScrapFreqDays,
-//         cs.IsScrapEnabled,
-//         cs.UpdatedAt,
-//         cs.UpdatedBy
-//       ORDER BY cs.CategoryName
-//     `);
-//     console.log(`✅ /api/category-settings — ${result.recordset.length} rows`);
-//     res.json({ success: true, data: result.recordset });
-//   } catch (err) {
-//     console.error('❌ /api/category-settings error:', err.message);
-//     res.status(500).json({ success: false, error: err.message });
-//   } finally {
-//     if (pool) await pool.close();
-//   }
-// });
+
 
 
 
@@ -1787,85 +1609,7 @@ app.put('/api/category-settings/:category', requireAuth, async (req, res) => {
 
 
 
-// app.put('/api/category-settings/:category', requireAuth, async (req, res) => {
-//   const categoryName = decodeURIComponent(req.params.category);
-//   const { GST, CostOfBusiness, ProfitMargin, ScrapFreqDays, IsScrapEnabled } = req.body;
-//   const updatedBy = req.session?.user?.email || 'unknown';
 
-//   if (GST !== undefined && GST !== null) {
-//     const v = parseFloat(GST);
-//     if (isNaN(v) || v < 0 || v > 100) {
-//       return res.status(400).json({ success: false, error: 'GST must be between 0 and 100' });
-//     }
-//   }
-//   if (CostOfBusiness !== undefined && CostOfBusiness !== null) {
-//     const v = parseFloat(CostOfBusiness);
-//     if (isNaN(v) || v < 0 || v > 100) {
-//       return res.status(400).json({ success: false, error: 'CostOfBusiness must be between 0 and 100' });
-//     }
-//   }
-//   if (ProfitMargin !== undefined && ProfitMargin !== null) {
-//     const v = parseFloat(ProfitMargin);
-//     if (isNaN(v) || v < 0 || v > 100) {
-//       return res.status(400).json({ success: false, error: 'ProfitMargin must be between 0 and 100' });
-//     }
-//   }
-//   if (ScrapFreqDays !== undefined && ScrapFreqDays !== null) {
-//     const v = parseInt(ScrapFreqDays);
-//     if (isNaN(v) || v < 1 || v > 365) {
-//       return res.status(400).json({ success: false, error: 'ScrapFreqDays must be between 1 and 365' });
-//     }
-//   }
-
-//   let pool;
-//   try {
-//     pool = await getSqlPool();
-
-//     const result = await pool.request()
-//       .input('CategoryName',    sql.NVarChar(200),  categoryName)
-//       .input('GST',             sql.Decimal(5, 2),  GST            ?? null)
-//       .input('CostOfBusiness',  sql.Decimal(5, 2),  CostOfBusiness ?? null)
-//       .input('ProfitMargin',    sql.Decimal(5, 2),  ProfitMargin   ?? null)
-//       .input('ScrapFreqDays',   sql.Int,             ScrapFreqDays  ?? 7)
-//       .input('IsScrapEnabled',  sql.Bit,             IsScrapEnabled ?? 1)
-//       .input('UpdatedBy',       sql.NVarChar(150),   updatedBy)
-//       .query(`
-//         MERGE CategorySettings AS target
-//         USING (SELECT @CategoryName AS CategoryName) AS source
-//           ON target.CategoryName = source.CategoryName
-
-//         WHEN MATCHED THEN
-//           UPDATE SET
-//             GST            = @GST,
-//             CostOfBusiness = @CostOfBusiness,
-//             ProfitMargin   = @ProfitMargin,
-//             ScrapFreqDays  = @ScrapFreqDays,
-//             IsScrapEnabled = @IsScrapEnabled,
-//             UpdatedAt      = GETDATE(),
-//             UpdatedBy      = @UpdatedBy
-
-//         WHEN NOT MATCHED THEN
-//           INSERT (CategoryName, GST, CostOfBusiness, ProfitMargin,
-//                   ScrapFreqDays, IsScrapEnabled, UpdatedAt, UpdatedBy)
-//           VALUES (@CategoryName, @GST, @CostOfBusiness, @ProfitMargin,
-//                   @ScrapFreqDays, @IsScrapEnabled, GETDATE(), @UpdatedBy);
-
-//         SELECT CategoryName, GST, CostOfBusiness, ProfitMargin,
-//                ScrapFreqDays, IsScrapEnabled, UpdatedAt, UpdatedBy
-//         FROM CategorySettings
-//         WHERE CategoryName = @CategoryName;
-//       `);
-
-//     console.log(`✅ /api/category-settings/${categoryName} — updated by ${updatedBy}`);
-//     res.json({ success: true, data: result.recordset[0] });
-
-//   } catch (err) {
-//     console.error(`❌ /api/category-settings/${categoryName} error:`, err.message);
-//     res.status(500).json({ success: false, error: err.message });
-//   } finally {
-//     if (pool) await pool.close();
-//   }
-// });
 
 
 
@@ -2268,21 +2012,7 @@ app.post('/api/scraper-job/:jobId/cancel', requireRole(['admin', 'supervisor']),
 });
 
 
-// app.post('/api/scraper-job/:jobId/cancel', requireRole(['admin', 'supervisor']), (req, res) => {
-//   const job = scraperJobs.get(req.params.jobId);
-//   if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
-//   if (job.status !== 'running') {
-//     return res.status(400).json({ success: false, error: 'Job is not running' });
-//   }
 
-//   job.cancelRequested = true;
-//   const cancelledBy = req.session?.user?.email || 'unknown';
-//   const timestamp = new Date().toLocaleTimeString('en-IN', { hour12: false });
-//   job.logs.push(`[${timestamp}] 🛑 Cancel requested by ${cancelledBy} — will stop after current category finishes.`);
-
-//   console.log(`🛑 Scraper cancel requested by ${cancelledBy} | job=${req.params.jobId}`);
-//   res.json({ success: true, message: 'Cancel requested — scraper will stop after current category finishes.' });
-// });
 
 
 // ── GET /api/scraper-job/:jobId/logs ──────────────────────────
@@ -2654,114 +2384,6 @@ app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
     if (pool) await pool.close();
   }
 });
-
-
-
-
-
-
-
-
-
-
-
-// ── POST /api/push-to-shopify ─────────────────────────────────
-// app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
-//   const { skuId, sp, isManual, confirmVariance } = req.body;
-
-//   if (!skuId || sp == null) {
-//     return res.status(400).json({ success: false, error: 'skuId and sp are required' });
-//   }
-//   const parsedSP = parseFloat(sp);
-//   if (isNaN(parsedSP) || parsedSP <= 0) {
-//     return res.status(400).json({ success: false, error: 'sp must be a positive number' });
-//   }
-
-//   const pushedBy = req.session?.user?.email || 'unknown';
-//   let pool;
-//   try {
-//     pool = await getSqlPool();
-
-//     // ── Variance check — against your own DB, before Shopify is touched at all ──
-//     const checkRow = await pool.request()
-//       .input('SKU_ID', sql.NVarChar(100), skuId)
-//       .query(`SELECT RecommendedSP, SP FROM InternalProducts WHERE SKU_ID = @SKU_ID`); // ← added SP
-
-//     if (!checkRow.recordset.length) {
-//       return res.status(404).json({ success: false, error: `SKU not found: ${skuId}` });
-//     }
-
-//     const currentSP = checkRow.recordset[0].SP; // ← NEW: value before this push, for OldSellingPrice
-//     const systemSPRaw = checkRow.recordset[0].RecommendedSP;
-//     const systemSP = systemSPRaw != null ? parseFloat(systemSPRaw) : null;
-
-//     const VARIANCE_THRESHOLD = await getNumericSetting(pool, 'VARIANCE_THRESHOLD', 0.10);
-//     let variance = 0;
-//     let requiresConfirm = false;
-
-//     if (systemSP === null || isNaN(systemSP) || systemSP <= 0) {
-//       requiresConfirm = true;
-//     } else {
-//       variance = Math.abs(parsedSP - systemSP) / systemSP;
-//       requiresConfirm = variance > VARIANCE_THRESHOLD;
-//     }
-
-//     if (requiresConfirm && !confirmVariance) {
-//       return res.status(422).json({
-//         success: false,
-//         error: 'variance_check_failed',
-//         message: systemSP
-//           ? `Entered SP (₹${parsedSP}) differs from system RecommendedSP (₹${systemSP}) by ${(variance * 100).toFixed(1)}%. Confirm to proceed.`
-//           : `No system-calculated RecommendedSP is stored for this SKU yet — please confirm ₹${parsedSP} is correct before pushing.`,
-//         systemSP,
-//       });
-//     }
-
-//     // Push to Shopify first — don't touch SQL if this fails
-//     await pushPriceToShopify(skuId, parsedSP);
-
-//     const request = pool.request()
-//       .input('SKU_ID',          sql.NVarChar(100),  skuId)
-//       .input('SP',              sql.Decimal(10, 2), parsedSP)
-//       .input('OldSellingPrice', sql.Decimal(10, 2), currentSP) // ← NEW
-//       .input('PushedBy',        sql.NVarChar(150),  pushedBy);
-
-//     let updateQuery = `
-//       UPDATE InternalProducts
-//       SET ShopifyPushedSP = @SP, ShopifyPushedAt = GETDATE(),
-//           ShopifyPushedBy = @PushedBy, ShopifyPushStatus = 'success',
-//           OldSellingPrice = @OldSellingPrice
-//     `;
-//     if (isManual) {
-//       updateQuery += `,
-//           ManualRecommendedSP = @SP, ManualRecommendedSP_UpdatedAt = GETDATE(),
-//           ManualRecommendedSP_UpdatedBy = @PushedBy
-//       `;
-//     }
-//     updateQuery += ` WHERE SKU_ID = @SKU_ID;
-//       SELECT SKU_ID, RecommendedSP, ManualRecommendedSP, ShopifyPushedSP, ShopifyPushedAt, OldSellingPrice
-//       FROM InternalProducts WHERE SKU_ID = @SKU_ID;
-//     `;
-
-//     const result = await request.query(updateQuery);
-
-//     console.log(`✅ Pushed to Shopify: SKU=${skuId} | SP=₹${parsedSP} (was ₹${currentSP ?? 'N/A'}) | By=${pushedBy} | Manual=${!!isManual}`);
-//     res.json({ success: true, data: result.recordset[0] });
-//   } catch (err) {
-//     console.error(`❌ /api/push-to-shopify error for ${skuId}:`, err.message);
-//     try {
-//       const failPool = await getSqlPool();
-//       await failPool.request()
-//         .input('SKU_ID', sql.NVarChar(100), skuId)
-//         .query(`UPDATE InternalProducts SET ShopifyPushStatus = 'failed' WHERE SKU_ID = @SKU_ID`);
-//     } catch (_) {}
-//     res.status(500).json({ success: false, error: err.message });
-//   } finally {
-//     if (pool) await pool.close();
-//   }
-// });
-
-
 
 
 
