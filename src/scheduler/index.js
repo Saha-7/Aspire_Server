@@ -347,7 +347,7 @@ function clearCategoryCache(storeName, categorySlug) {
 }
 
 // ── Push scraped products to Cosmos ──────────────────────────
-async function pushScrapedDataToCosmos(products, label, log) {
+async function pushScrapedDataToCosmos(products, label, log, meta = {}) {
   if (!products || products.length === 0) {
     log(`⚠️  No products to push for ${label}`);
     return { pushed: 0, failed: 0 };
@@ -379,6 +379,10 @@ async function pushScrapedDataToCosmos(products, label, log) {
   for (const product of products) {
     try {
       product.id = Buffer.from(product.url).toString('base64').substring(0, 255);
+      // Carry the store page slug into Cosmos so cleanup_mapper can store it in
+      // CompetitorPrices.StoreSlug and Insights can resolve the internal category
+      // via CategoryMappings (StoreName + StoreSlug -> InternalCategory).
+      if (meta.storeSlug) product.storeSlug = meta.storeSlug;
       await container.items.upsert(product);
       pushed++;
     } catch (err) {
@@ -433,6 +437,26 @@ function groupByStoreSlug(entries) {
     map.get(key).categoryNames.push(entry.categoryName);
   }
   return [...map.values()];
+}
+
+// ── Per-group watchdog ────────────────────────────────────────
+// One store page that never settles (a hung request, a stuck promise) used to
+// keep the WHOLE run "running" forever: Promise.all waited for it, so
+// diagnostics were never saved and the cleanup mapper never ran. After the
+// limit the group is marked failed and the run carries on without it.
+// Default 240 min (a slow 137-product page legitimately took ~133 min);
+// override with SCRAPE_GROUP_TIMEOUT_MIN.
+function withGroupWatchdog(group, log, work, onTimeout) {
+  const ms = (Number(process.env.SCRAPE_GROUP_TIMEOUT_MIN) || 240) * 60_000;
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => {
+      log(`⏱️  ${group.storeName}/${group.slug} did not finish within ${ms / 60000} min — giving up on it so the run can finish (its categories are NOT locked, safe to retry)`);
+      try { onTimeout && onTimeout(); } catch (_) {}
+      resolve();
+    }, ms);
+  });
+  return Promise.race([work(), timeout]).finally(() => clearTimeout(timer));
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -692,7 +716,7 @@ async function runScheduler(options = {}) {
     // cancel fires are skipped, but any group already mid-scrape will
     // finish (same "never cancel mid-scrape" intent, adapted for
     // concurrent groups instead of one at a time).
-    await Promise.all(dueGroups.map(async (group) => {
+    await Promise.all(dueGroups.map((group) => withGroupWatchdog(group, log, async () => {
       if (isCancelled()) {
         log(`🛑 Cancellation requested — skipping ${group.storeName}/${group.slug} (will retry next run)`);
         return;
@@ -731,7 +755,8 @@ async function runScheduler(options = {}) {
           const { pushed } = await pushScrapedDataToCosmos(
             result.products,
             `${store.name}/${category.slug}`,
-            log
+            log,
+            { storeSlug: category.slug }
           );
           totalPushed += pushed;
         }
@@ -746,7 +771,7 @@ async function runScheduler(options = {}) {
         log(`   ❌ Scrape failed for ${store.name}/${category.slug}: ${err.message}`);
         totalFailed++;
       }
-    }));
+    }, () => { totalFailed++; })));
 
     if (categoriesDone > 0) {
       log('\n📤 Running cleanup mapper (Cosmos → SQL CompetitorPrices)...');
@@ -897,7 +922,7 @@ async function runManualScraper(options = {}) {
     // concurrently.
     const sqlMutex = createMutex();
 
-    await Promise.all(entryGroups.map(async (group) => {
+    await Promise.all(entryGroups.map((group) => withGroupWatchdog(group, log, async () => {
       if (isCancelled()) {
         log(`Cancellation requested — skipping ${group.storeName}/${group.slug} (will retry next run)`);
         return;
@@ -964,7 +989,8 @@ async function runManualScraper(options = {}) {
           const { pushed } = await pushScrapedDataToCosmos(
             result.products,
             `${store.name}/${category.slug}`,
-            log
+            log,
+            { storeSlug: category.slug }
           );
           totalPushed += pushed;
         }
@@ -996,7 +1022,17 @@ async function runManualScraper(options = {}) {
           errorMessage: err.message,
         });
       }
-    }));
+    }, () => {
+      group.categoryNames.forEach(c => failedCategories.add(c));
+      totalFailed++;
+      statsRows.push({
+        runId, runStartedAt, startedBy,
+        storeName: group.storeName, storeSlug: group.slug,
+        categoryNames: group.categoryNames,
+        status: 'error',
+        errorMessage: 'Timed out — group did not finish (see SCRAPE_GROUP_TIMEOUT_MIN)',
+      });
+    })));
 
     let diagnosticsSaved = false;
     if (statsRows.length > 0) {
