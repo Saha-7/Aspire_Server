@@ -34,7 +34,10 @@ const {
 } = require('./recommendation_engine');
 
 
-const { getInsights, dismissInsight, bulkDismissInsights } = require('./services/insightsService');
+const {
+  getInsights, getInsightCounts, getInsightsExport, buildInsightsExportCsv,
+  dismissInsight, bulkDismissInsights,
+} = require('./services/insightsService');
 
 const { scrapeProduct }    = require('./scraper/scrapeProduct');
 const { upsertOneProduct } = require('./services/competitorPriceService');
@@ -78,8 +81,8 @@ app.use(session({
   resave           : false,
   saveUninitialized: false,
   cookie: {
-    secure  : false,
-    sameSite: 'lax',
+    secure  : true,
+    sameSite: 'none',
     httpOnly: true,
     maxAge  : 24 * 60 * 60 * 1000, // 24 hours
   },
@@ -851,12 +854,13 @@ app.get('/api/pp-template-csv', requireAuth, async (req, res) => {
 app.get('/api/insights', requireAuth, async (req, res) => {
   try {
     const pool = await getSqlPool();
-    const { category, brand, alertType, search, sortBy, page, pageSize, minThreshold, skipRecompute } = req.query;
+    const { category, brand, alertType, search, days, sortBy, page, pageSize, minThreshold, skipRecompute } = req.query;
     const result = await getInsights(pool, {
       category: category || null,
       brand: brand || null,
       alertType: alertType || null,
       search: search || null,
+      days: days || null,
       sortBy: sortBy || 'newest',
       page: page ? parseInt(page, 10) : null,
       pageSize: pageSize ? parseInt(pageSize, 10) : null,
@@ -866,6 +870,49 @@ app.get('/api/insights', requireAuth, async (req, res) => {
     res.json({ success: true, ...result });
   } catch (err) {
     console.error('❌ /api/insights error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── GET /api/insights/counts ─────────────────────────────────
+// One cheap GROUP BY for the summary cards / tab counts (optionally limited to
+// the last N days) — replaces four full /api/insights reads.
+app.get('/api/insights/counts', requireAuth, async (req, res) => {
+  try {
+    const pool = await getSqlPool();
+    const counts = await getInsightCounts(pool, { days: req.query.days || null });
+    res.json({ success: true, ...counts });
+  } catch (err) {
+    console.error('❌ /api/insights/counts error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── GET /api/insights/export.csv ─────────────────────────────
+// CSV for the Out of stock and Not in catalog tabs. Applies the same filters as
+// the table (category, brand, search, days) but returns ALL matching rows.
+app.get('/api/insights/export.csv', requireAuth, async (req, res) => {
+  const { alertType, category, brand, search, days } = req.query;
+  if (alertType !== 'OOS' && alertType !== 'NO_LISTING') {
+    return res.status(400).json({ success: false, error: 'alertType must be OOS or NO_LISTING' });
+  }
+  try {
+    const pool = await getSqlPool();
+    const exportData = await getInsightsExport(pool, {
+      alertType,
+      category: category || null,
+      brand: brand || null,
+      search: search || null,
+      days: days || null,
+    });
+    const csv = buildInsightsExportCsv(exportData, alertType);
+    const stamp = new Date().toISOString().slice(0, 10);
+    const name = alertType === 'OOS' ? 'out_of_stock' : 'not_in_catalog';
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="insights_${name}_${stamp}.csv"`);
+    res.send(csv);
+  } catch (err) {
+    console.error('❌ /api/insights/export.csv error:', err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -1021,8 +1068,6 @@ app.post('/api/insights/:id/dismiss', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('❌ /api/insights/:id/dismiss error:', err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
