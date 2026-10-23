@@ -135,35 +135,28 @@ function collectMatchedSkuRows(products, { allSkuSet, eligibleSkuSet, detailsByS
   const rows = [];
 
   for (const product of products) {
-    const { sku, stockStatus } = extractSkuAndStock(product);
+    const { sku, stockStatus, competitorPrice, productUrl, scrapedAt } = extractSkuAndStock(product);
     const key = normalizeSkuKey(sku);
+    const shared = { competitorPrice, competitorStockStatus: stockStatus, productUrl, scrapedAt };
 
-    // No SKU at all on the scraped product — still goes in the CSV now.
     if (!key) {
       rows.push({
-        runId        : context.runId,
-        runStartedAt : context.runStartedAt,
-        storeName    : context.storeName,
-        storeSlug    : context.storeSlug,
-        categoryNames: context.categoryNames,
-        sku          : (sku || '').trim() || '(no SKU)',
-        matchStatus  : 'No SKU',
-        reason       : 'Competitor product has no SKU',
+        runId: context.runId, runStartedAt: context.runStartedAt,
+        storeName: context.storeName, storeSlug: context.storeSlug, categoryNames: context.categoryNames,
+        sku: (sku || '').trim() || '(no SKU)',
+        matchStatus: 'No SKU', reason: 'Competitor product has no SKU',
+        pp: null, isActive: null, isInStock: null, ...shared,
       });
       continue;
     }
 
-    // SKU exists on the competitor page, but isn't a known internal SKU.
     if (!allSkuSet.has(key)) {
       rows.push({
-        runId        : context.runId,
-        runStartedAt : context.runStartedAt,
-        storeName    : context.storeName,
-        storeSlug    : context.storeSlug,
-        categoryNames: context.categoryNames,
-        sku          : sku.trim(),
-        matchStatus  : 'No SKU Match',
-        reason       : 'SKU not found in InternalProducts',
+        runId: context.runId, runStartedAt: context.runStartedAt,
+        storeName: context.storeName, storeSlug: context.storeSlug, categoryNames: context.categoryNames,
+        sku: sku.trim(),
+        matchStatus: 'No SKU Match', reason: 'SKU not found in InternalProducts',
+        pp: null, isActive: null, isInStock: null, ...shared,
       });
       continue;
     }
@@ -181,14 +174,15 @@ function collectMatchedSkuRows(products, { allSkuSet, eligibleSkuSet, detailsByS
     }
 
     rows.push({
-      runId        : context.runId,
-      runStartedAt : context.runStartedAt,
-      storeName    : context.storeName,
-      storeSlug    : context.storeSlug,        // "Competitor Category Name" per Pritam's call
-      categoryNames: context.categoryNames,     // TPSTECH Category Name(s)
-      sku          : sku.trim(),                // original casing, just trimmed — easier to read/search
-      matchStatus  : strictPass ? 'Recommendation Match' : 'Basic Match',
-      reason       : reasons.join('; ') || null,
+      runId: context.runId, runStartedAt: context.runStartedAt,
+      storeName: context.storeName, storeSlug: context.storeSlug, categoryNames: context.categoryNames,
+      sku: sku.trim(),
+      matchStatus: strictPass ? 'Recommendation Match' : 'Basic Match',
+      reason: reasons.join('; ') || null,
+      pp: internal.PP ?? null,
+      isActive: internal.isActive ?? null,
+      isInStock: internal.isInStock ?? null,
+      ...shared,
     });
   }
 
@@ -279,19 +273,28 @@ async function getRunDetail(pool, runId) {
 async function saveSkuMatchRows(pool, rows) {
   for (const row of rows) {
     await pool.request()
-      .input('RunId',         sql.NVarChar(36),  row.runId)
-      .input('RunStartedAt',  sql.DateTime2,     row.runStartedAt)
-      .input('StoreName',     sql.NVarChar(100), row.storeName)
-      .input('StoreSlug',     sql.NVarChar(100), row.storeSlug)
-      .input('CategoryNames', sql.NVarChar(500), (row.categoryNames || []).join(', '))
-      .input('SKU',           sql.NVarChar(100), row.sku)
-      .input('MatchStatus',   sql.NVarChar(30),  row.matchStatus)
-      .input('Reason',        sql.NVarChar(500), row.reason || null)
+      .input('RunId',                sql.NVarChar(36),  row.runId)
+      .input('RunStartedAt',         sql.DateTime2,     row.runStartedAt)
+      .input('StoreName',            sql.NVarChar(100), row.storeName)
+      .input('StoreSlug',            sql.NVarChar(100), row.storeSlug)
+      .input('CategoryNames',        sql.NVarChar(500), (row.categoryNames || []).join(', '))
+      .input('SKU',                  sql.NVarChar(100), row.sku)
+      .input('MatchStatus',          sql.NVarChar(30),  row.matchStatus)
+      .input('Reason',               sql.NVarChar(500), row.reason || null)
+      .input('PP',                   sql.Decimal(10,2), row.pp ?? null)
+      .input('IsActive',             sql.Bit,           row.isActive ?? null)
+      .input('IsInStock',            sql.Bit,           row.isInStock ?? null)
+      .input('CompetitorPrice',      sql.Decimal(10,2), row.competitorPrice ?? null)
+      .input('CompetitorStockStatus',sql.NVarChar(50),  row.competitorStockStatus || null)
+      .input('ProductURL',           sql.NVarChar(500), row.productUrl || null)
+      .input('ScrapedAt',            sql.NVarChar(50),  row.scrapedAt || null)
       .query(`
         INSERT INTO ScrapeRunSkuMatches (
-          RunId, RunStartedAt, StoreName, StoreSlug, CategoryNames, SKU, MatchStatus, Reason
+          RunId, RunStartedAt, StoreName, StoreSlug, CategoryNames, SKU, MatchStatus, Reason,
+          PP, IsActive, IsInStock, CompetitorPrice, CompetitorStockStatus, ProductURL, ScrapedAt
         ) VALUES (
-          @RunId, @RunStartedAt, @StoreName, @StoreSlug, @CategoryNames, @SKU, @MatchStatus, @Reason
+          @RunId, @RunStartedAt, @StoreName, @StoreSlug, @CategoryNames, @SKU, @MatchStatus, @Reason,
+          @PP, @IsActive, @IsInStock, @CompetitorPrice, @CompetitorStockStatus, @ProductURL, @ScrapedAt
         )
       `);
   }
@@ -329,18 +332,27 @@ function csvEscape(value) {
   return str;
 }
 
+function boolLabel(v) {
+  if (v === null || v === undefined) return '';
+  return (v === true || v === 1) ? 'Yes' : 'No';
+}
+
 function buildSkuMatchesCsv(rows) {
-  const header = ['SKU', 'Competitor Store Name', 'Competitor Category Name', 'TPSTECH Category Name', 'Match Status', 'Reason'];
+  const header = [
+    'SKU', 'Competitor Store Name', 'Competitor Category Name', 'TPSTECH Category Name',
+    'Match Status', 'Reason',
+    'Internal PP', 'Internal Active', 'Internal In Stock',
+    'Competitor Price', 'Competitor Stock Status', 'Scraped At', 'Product URL',
+  ];
   const lines = [header.join(',')];
 
   for (const row of rows) {
     lines.push([
-      csvEscape(row.SKU),
-      csvEscape(row.StoreName),
-      csvEscape(row.StoreSlug),
-      csvEscape(row.CategoryNames),
-      csvEscape(row.MatchStatus),
-      csvEscape(row.Reason),
+      csvEscape(row.SKU), csvEscape(row.StoreName), csvEscape(row.StoreSlug), csvEscape(row.CategoryNames),
+      csvEscape(row.MatchStatus), csvEscape(row.Reason),
+      csvEscape(row.PP), csvEscape(boolLabel(row.IsActive)), csvEscape(boolLabel(row.IsInStock)),
+      csvEscape(row.CompetitorPrice), csvEscape(row.CompetitorStockStatus),
+      csvEscape(row.ScrapedAt), csvEscape(row.ProductURL),
     ].join(','));
   }
 

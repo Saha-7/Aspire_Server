@@ -854,7 +854,7 @@ app.get('/api/pp-template-csv', requireAuth, async (req, res) => {
 app.get('/api/insights', requireAuth, async (req, res) => {
   try {
     const pool = await getSqlPool();
-    const { category, brand, alertType, search, days, sortBy, page, pageSize, minThreshold, skipRecompute } = req.query;
+    const { category, brand, alertType, search, days, sortBy, page, pageSize, minThreshold, skipRecompute, refresh } = req.query;
     const result = await getInsights(pool, {
       category: category || null,
       brand: brand || null,
@@ -866,6 +866,7 @@ app.get('/api/insights', requireAuth, async (req, res) => {
       pageSize: pageSize ? parseInt(pageSize, 10) : null,
       minThresholdPct: minThreshold != null ? parseFloat(minThreshold) : null,
       skipRecompute: skipRecompute === 'true',
+      forceRecompute: refresh === 'true',
     });
     res.json({ success: true, ...result });
   } catch (err) {

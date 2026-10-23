@@ -63,22 +63,22 @@ const STORES = [
       { slug: 'motherboards',    url: 'https://mdcomputers.in/catalog/motherboard' },
       {slug: 'cabinet', url: 'https://mdcomputers.in/catalog/cabinet'},
 
-      {slug: '', url: ''},
-      {slug: '', url: ''},
-      {slug: '', url: ''},
-      {slug: '', url: ''},
-      {slug: '', url: ''},
-      {slug: '', url: ''},
-      {slug: '', url: ''},
-      {slug: '', url: ''},
-      {slug: '', url: ''},
-      {slug: '', url: ''},
-      {slug: '', url: ''},
-      {slug: '', url: ''},
-      {slug: '', url: ''},
-      {slug: '', url: ''},
-      {slug: '', url: ''},
-      {slug: '', url: ''}
+//       {slug: '', url: ''},
+//       {slug: '', url: ''},
+//       {slug: '', url: ''},
+//       {slug: '', url: ''},
+//       {slug: '', url: ''},
+//       {slug: '', url: ''},
+//       {slug: '', url: ''},
+//       {slug: '', url: ''},
+//       {slug: '', url: ''},
+//       {slug: '', url: ''},
+//       {slug: '', url: ''},
+//       {slug: '', url: ''},
+//       {slug: '', url: ''},
+//       {slug: '', url: ''},
+//       {slug: '', url: ''},
+//       {slug: '', url: ''}
 
     ],
   },
@@ -216,7 +216,7 @@ const STORES = [
 
 
 
-// src/urls.js
+// // src/urls.js
 {
   name: "computechstore",
   parser: require("./parsers/computechstore"),
@@ -241,7 +241,7 @@ const STORES = [
 },
 
 
-// src/urls.js
+// // src/urls.js
 {
   name: "varietyinfotech",
   parser: require("./parsers/varietyinfotech"),
@@ -257,18 +257,18 @@ const STORES = [
     { slug: 'monitor', url: 'https://varietyinfotech.com/product-category/monitor/'},
     { slug: 'mouse', url: 'https://varietyinfotech.com/product-category/mouse/'},
     { slug: 'keyboards', url: 'https://varietyinfotech.com/product-category/keyboards/'}
-    //{ slug: '', url: ''},
-    // { slug: '', url: ''},
-    // { slug: '', url: ''},
-    // { slug: '', url: ''},
-    // { slug: '', url: ''},
-    //{ slug: '', url: ''},
-    // { slug: '', url: ''},
-    // { slug: '', url: ''},
-    // { slug: '', url: ''},
-    // { slug: '', url: ''},
-  ],
-}
+//     //{ slug: '', url: ''},
+//     // { slug: '', url: ''},
+//     // { slug: '', url: ''},
+//     // { slug: '', url: ''},
+//     // { slug: '', url: ''},
+//     //{ slug: '', url: ''},
+//     // { slug: '', url: ''},
+//     // { slug: '', url: ''},
+//     // { slug: '', url: ''},
+//     // { slug: '', url: ''},
+   ],
+ }
 
 ];
 
