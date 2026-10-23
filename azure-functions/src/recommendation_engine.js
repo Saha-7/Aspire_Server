@@ -7,6 +7,7 @@
 require('dotenv').config();
 const sql = require('mssql');
 const { AzureCliCredential, ManagedIdentityCredential } = require('@azure/identity');
+const { log } = require('../blobLogger');
 
 // ── System-wide defaults (used when CategorySettings has no override) ──
 const DEFAULT_GST             = 0.18;
@@ -34,9 +35,6 @@ async function getSqlPool() {
 }
 
 // ── Load CategorySettings — build a map keyed by CategoryName ────────
-// Returns Map<string, { gst, costOfBusiness, profitMargin }>
-// All values are decimals (e.g. 0.18), already converted from the
-// percentage numbers stored in the DB (e.g. 18 → 0.18).
 async function loadCategorySettings(pool) {
   console.log('⚙️  Loading category settings...');
 
@@ -59,8 +57,6 @@ async function loadCategorySettings(pool) {
 }
 
 // ── Get effective business variables for a product's category ─────────
-// Prefers category-level settings; falls back to system defaults for any
-// value that is NULL (not yet configured).
 function getBusinessVars(categorySettings, categoryName) {
   const settings = categorySettings.get(categoryName);
 
@@ -82,6 +78,7 @@ async function loadInternalProducts(pool) {
       PP,
       SP,
       Category,
+      Brand,
       LastBillDate,
       ManualPP_UpdatedAt,
       ManualPP_UpdatedBy
@@ -92,6 +89,36 @@ async function loadInternalProducts(pool) {
   `);
 
   console.log(`   ✅ ${result.recordset.length} eligible internal products`);
+  return result.recordset;
+}
+
+// ── Step 1b: Load EVERY internal product, no eligibility filter ───────
+// Used by /api/internal-recommendations now that Basic Recommendations
+// must show the whole InternalProducts table — active or inactive, PP
+// available or not — the same way Purchase Price Update does. The
+// original loadInternalProducts() above stays untouched: the Competitor
+// Based (Intelligence) engine still needs the PP/active/in-stock filter
+// for its own math and is left exactly as it was.
+async function loadAllInternalProducts(pool) {
+  console.log('📦 Loading ALL internal products (no eligibility filter)...');
+
+  const result = await pool.request().query(`
+    SELECT
+      SKU_ID,
+      Title,
+      PP,
+      SP,
+      Category,
+      Brand,
+      isActive,
+      isInStock,
+      LastBillDate,
+      ManualPP_UpdatedAt,
+      ManualPP_UpdatedBy
+    FROM InternalProducts
+  `);
+
+  console.log(`   ✅ ${result.recordset.length} total internal products`);
   return result.recordset;
 }
 
@@ -142,8 +169,6 @@ function buildCompetitorMap(competitorRows) {
 }
 
 // ── Step 4: Calculate recommended price ──────────────────────────────
-// Now receives the three business vars so each category can have
-// different rates.
 function calculateRecommendedPrice(pp, lowestCompetitorPrice, gst, costOfBusiness, profitMargin) {
   const multiplier = 1 + gst + costOfBusiness + profitMargin;
   const basePrice  = parseFloat((pp * multiplier).toFixed(2));
@@ -168,7 +193,6 @@ function generateRecommendations(internalProducts, competitorMap, categorySettin
   let skippedNoMatch = 0, strategyFloor = 0, strategyOptimized = 0;
   let sourceBill = 0, sourceManual = 0;
 
-  // Track which categories used custom vs default settings for the log
   const categoryVarLog = new Map();
 
   for (const product of internalProducts) {
@@ -182,11 +206,9 @@ function generateRecommendations(internalProducts, competitorMap, categorySettin
     if (source === 'manual') sourceManual++;
     else                     sourceBill++;
 
-    // ── Look up per-category business variables ───────────────
     const { gst, costOfBusiness, profitMargin } = getBusinessVars(categorySettings, product.Category);
     const multiplier = 1 + gst + costOfBusiness + profitMargin;
 
-    // Log per-category vars once
     if (!categoryVarLog.has(product.Category)) {
       categoryVarLog.set(product.Category, { gst, costOfBusiness, profitMargin, multiplier });
     }
@@ -237,6 +259,9 @@ function generateRecommendations(internalProducts, competitorMap, categorySettin
   console.log(`      🔼 Optimized : ${strategyOptimized}`);
   console.log(`      🔒 Floor     : ${strategyFloor}`);
 
+  log('INFO', 'recommendation_engine.js', 'generateRecommendations',
+    `Generated: ${recommendations.length}, Skipped: ${skippedNoMatch}, Bill PP: ${sourceBill}, Manual PP: ${sourceManual}, Optimized: ${strategyOptimized}, Floor: ${strategyFloor}`);
+
   return recommendations;
 }
 
@@ -260,11 +285,13 @@ async function updateRecommendedSP(pool, recommendations) {
     } catch (err) {
       failed++;
       console.error(`   → ${row.SKU_ID}: ${err.message}`);
+      log('ERROR', 'recommendation_engine.js', 'updateRecommendedSP', `${row.SKU_ID}: ${err.message}`);
     }
   }
 
   console.log(`   ✅ Updated : ${updated}`);
   console.log(`   ❌ Failed  : ${failed}`);
+  log('INFO', 'recommendation_engine.js', 'updateRecommendedSP', `Updated: ${updated}, Failed: ${failed}`);
 }
 
 async function run() {
@@ -273,13 +300,13 @@ async function run() {
   console.log('🚀 Recommendation Engine starting...');
   console.log(`   System defaults: GST=${DEFAULT_GST * 100}% | COB=${DEFAULT_COST_OF_BUSINESS * 100}% | Margin=${DEFAULT_PROFIT_MARGIN * 100}%`);
   console.log(`   (Per-category overrides loaded from CategorySettings table)\n`);
+  log('INFO', 'recommendation_engine.js', 'run', 'Recommendation engine run started');
 
   let pool;
   try {
     pool = await getSqlPool();
     console.log('🔌 Connected\n');
 
-    // Load category settings FIRST — passed into generateRecommendations
     const categorySettings = await loadCategorySettings(pool);
     const internalProducts = await loadInternalProducts(pool);
     const competitorRows   = await loadCompetitorPrices(pool);
@@ -288,23 +315,23 @@ async function run() {
 
     if (recommendations.length === 0) {
       console.log('\n⚠️  No recommendations generated.');
+      log('WARN', 'recommendation_engine.js', 'run', 'No recommendations generated');
       return;
     }
 
     await updateRecommendedSP(pool, recommendations);
 
-    console.log(`\n🎉 Done in ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
+    const totalSec = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`\n🎉 Done in ${totalSec}s`);
+    log('INFO', 'recommendation_engine.js', 'run', `Run complete in ${totalSec}s`);
   } catch (err) {
     console.error('\n❌ Fatal error:', err.message);
+    log('ERROR', 'recommendation_engine.js', 'run', `Fatal error: ${err.message}`);
     process.exit(1);
   } finally {
     if (pool) await pool.close();
   }
 }
-
-
-
-
 
 // Only auto-run when called directly via `npm run recommend`
 if (require.main === module) {
@@ -316,10 +343,15 @@ module.exports = {
   getSqlPool,
   loadCategorySettings,
   loadInternalProducts,
+  loadAllInternalProducts,
   loadCompetitorPrices,
   buildCompetitorMap,
   generateRecommendations,
   updateRecommendedSP,
-  resolveEffectivePP,   // ← NEW
-  getBusinessVars,      // ← NEW
+  resolveEffectivePP,
+  getBusinessVars,
+  calculateRecommendedPrice
 };
+
+
+
