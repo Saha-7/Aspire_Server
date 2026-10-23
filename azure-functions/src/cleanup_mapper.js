@@ -13,6 +13,7 @@ require('dotenv').config();
 
 const { CosmosClient }          = require('@azure/cosmos');
 const { upsertManyFromCosmos }  = require('./services/competitorPriceService');
+const { log }                   = require('../blobLogger');
 
 const client    = new CosmosClient(process.env.COSMOS_CONNECTION_STRING);
 const database  = client.database('ScraperDB');
@@ -20,12 +21,14 @@ const container = database.container('scrap_results');
 
 async function run() {
   console.log('📖 Reading from Cosmos...');
+  log('INFO', 'cleanup_mapper.js', 'run', 'Starting cleanup_mapper run — reading from Cosmos');
 
   const { resources } = await container.items
     .query('SELECT * FROM c')
     .fetchAll();
 
   console.log(`   Found ${resources.length} documents`);
+  log('INFO', 'cleanup_mapper.js', 'run', `Found ${resources.length} documents in Cosmos`);
 
   console.log('\n🔌 Connecting to Azure SQL...');
   const { mapped, skipped, inserted, updated, failed, failedRows } =
@@ -38,15 +41,20 @@ async function run() {
   console.log(`   Updated : ${updated}`);
   console.log(`   Failed  : ${failed}`);
 
+  log('INFO', 'cleanup_mapper.js', 'run',
+    `Done — Mapped: ${mapped}, Skipped: ${skipped}, Inserted: ${inserted}, Updated: ${updated}, Failed: ${failed}`);
+
   if (failedRows.length > 0) {
     console.log('\n❌ Failed rows:');
     failedRows.forEach(r => {
       console.log(`   SKU=${r.SKU} | Store=${r.StoreName} | Price=${r.Price} | Error=${r.Error}`);
+      log('ERROR', 'cleanup_mapper.js', 'run', `Failed row — SKU=${r.SKU}, Store=${r.StoreName}, Price=${r.Price}, Error=${r.Error}`);
     });
   }
 }
 
 run().catch(err => {
   console.error('❌ Fatal error:', err.message);
+  log('ERROR', 'cleanup_mapper.js', 'run', `Fatal error: ${err.message}`);
   process.exit(1);
 });
