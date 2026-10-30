@@ -152,6 +152,58 @@ function getNextPageUrl(html, currentUrl) {
 |--------------------------------------------------------------------------
 */
 
+// ── Price helpers ─────────────────────────────────────────────
+// parsePrice() downstream strips everything but digits and dots, so a text like
+// "₹ 4,450 Inclusive of all taxes (18% GST)" would turn into 445018. Always cut
+// the FIRST amount out of a text before it goes anywhere.
+function firstAmount(text) {
+  const t = cleanText(text);
+  if (!t) return null;
+  const m = t.match(/(?:₹|rs\.?|inr)\s*([\d,]+(?:\.\d+)?)/i) || t.match(/([\d,]*\d(?:\.\d+)?)/);
+  if (!m) return null;
+  const n = Number(m[1].replace(/,/g, ''));
+  return n > 0 ? `₹ ${m[1]}` : null;
+}
+
+// Structured data carries the price on every product page, even when the visible
+// price block uses a layout the selectors above don't know.
+//   1) JSON-LD offers.price   2) og/product meta tags
+//   3) Shopify's own tracking JSON: "variants":[{"price":445000,...}]  (price is in PAISE)
+function priceFromStructuredData($, html) {
+  let found = null;
+  $('script[type="application/ld+json"]').each((_, el) => {
+    if (found) return;
+    try {
+      const walk = (node) => {
+        if (!node || found) return;
+        if (Array.isArray(node)) return node.forEach(walk);
+        if (typeof node !== 'object') return;
+        const v = node.price ?? node.lowPrice;
+        if (v !== undefined && v !== null && Number(String(v).replace(/,/g, '')) > 0) {
+          found = String(v);
+          return;
+        }
+        Object.values(node).forEach(walk);
+      };
+      walk(JSON.parse($(el).contents().text()));
+    } catch (_) { /* malformed JSON-LD — try the next signal */ }
+  });
+  if (found) return found;
+
+  const meta =
+    $('meta[property="product:price:amount"]').attr('content') ||
+    $('meta[property="og:price:amount"]').attr('content') ||
+    $('meta[itemprop="price"]').attr('content');
+  if (meta && Number(String(meta).replace(/,/g, '')) > 0) return String(meta);
+
+  const m = String(html || '').match(/"variants"\s*:\s*\[\s*\{[^\]]*?"price"\s*:\s*"?(\d{3,9})"?/);
+  if (m) {
+    const rupees = Number(m[1]) / 100;
+    if (rupees > 0) return String(rupees);
+  }
+  return null;
+}
+
 function parseProductDetails(html, url) {
   const $ = cheerio.load(html);
 
@@ -173,6 +225,9 @@ function parseProductDetails(html, url) {
 |--------------------------------------------------------------------------
 */
 
+// 126 of 178 vishal products came back WITHOUT a price (the visible price
+// elements are not on every page layout). Fall back to the page's structured
+// data, which carries the price on every product page.
 const salePrice =
   cleanText(
     $('#js-product-price').first().text()
@@ -180,6 +235,14 @@ const salePrice =
   cleanText(
     $('.price--sale .current').first().text()
   ) ||
+  // Products WITHOUT a discount: in the scraped data every product that has an
+  // originalPrice also has a salePrice, and every one with originalPrice = null
+  // has salePrice = null — i.e. only the "sale" layout was ever read. Try the
+  // plain-price layout, then the page's structured data.
+  firstAmount($('.price .current').first().text()) ||
+  firstAmount($('[class*="price"] .current').first().text()) ||
+  firstAmount($('.price .price-item--regular, .price-item--sale, .product__price, .product-price').first().text()) ||
+  priceFromStructuredData($, html) ||
   null;
 
 const originalPrice =

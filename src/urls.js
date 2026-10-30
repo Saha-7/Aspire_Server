@@ -268,7 +268,27 @@ const STORES = [
 //     // { slug: '', url: ''},
 //     // { slug: '', url: ''},
    ],
- }
+ },
+
+
+ // {
+//     name: "elitehubs",
+//     parser: require("./parsers/elitehubs"),
+//     categories: [
+//       { slug: "graphic-cards", url: "https://elitehubs.com/collections/graphic-cards/products.json?limit=250" },
+//     ]  
+
+// },
+
+
+//  {
+//      name: "amazon",
+//      parser: require("./parsers/amazon"),
+//      categories: [
+//        { slug: "keyboards", url: "https://www.amazon.in/s?k=keyboard&rh=n%3A1375419031" },
+//        { slug: "monitors", url: "https://www.amazon.in/s?k=monitor&rh=n%3A1375425031" },
+//      ],
+//    },
 
 ];
 

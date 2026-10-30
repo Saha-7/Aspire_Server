@@ -142,6 +142,12 @@ const TOTAL_TIMEOUT_MS = Number(process.env.FETCH_TOTAL_TIMEOUT_MS) || 180_000;
  * @returns {Promise<string>} - HTML content
  */
 function fetchPage(targetUrl, retries = 3) {
+  // Some stores have spaces / brackets in their paths (e.g. theitdepot
+  // "/Power_Supply (PSU)/..."). Bright Data rejects those with HTTP 400
+  // ("url must be a valid URI"), so send the percent-encoded form.
+  let safeUrl = targetUrl;
+  try { safeUrl = new URL(targetUrl).href; } catch (_) { /* leave as is */ }
+
   const attempt = (n) => new Promise((resolve, reject) => {
     // Settle exactly once, and ALWAYS settle. Before this, a response that
     // started (headers received) and then stalled was destroyed by the idle
@@ -158,7 +164,7 @@ function fetchPage(targetUrl, retries = 3) {
     };
 
     const body = JSON.stringify({
-      url   : targetUrl,
+      url   : safeUrl,
       zone  : ZONE,
       format: 'raw',
     });
