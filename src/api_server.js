@@ -81,8 +81,8 @@ app.use(session({
   resave           : false,
   saveUninitialized: false,
   cookie: {
-    secure  : false,
-    sameSite: 'lax',
+    secure  : true,
+    sameSite: 'none',
     httpOnly: true,
     maxAge  : 24 * 60 * 60 * 1000, // 24 hours
   },
@@ -1049,7 +1049,7 @@ app.post('/api/insights/dismiss-bulk', requireAuth, async (req, res) => {
       return res.status(400).json({ success: false, error: 'ids must be a non-empty array' });
     }
     const pool = await getSqlPool();
-    const dismissedIds = await bulkDismissInsights(pool, ids, req.user?.email || 'unknown');
+    const dismissedIds = await bulkDismissInsights(pool, ids, req.session?.user?.email || req.user?.email || 'unknown');
     res.json({ success: true, data: dismissedIds });
   } catch (err) {
     console.error('❌ /api/insights/dismiss-bulk error:', err.message);

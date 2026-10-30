@@ -111,6 +111,46 @@ async function collectUrlsForCategory(store, startUrl, urlsCachePath, limit) {
  *   but the scheduler always passes ONE SHARED limiter so total
  *   concurrency across categories stays capped.
  */
+// ── Parser health check ───────────────────────────────────────
+// Store websites change their HTML without telling us, and a parser then keeps
+// "working" while quietly returning empty fields (vishal: no price on 71 % of
+// products). Every alert depends on price + stock, so after each store/category
+// we measure how many scraped products actually have them and shout when the
+// coverage drops — in the job log and the blob log, no manual parser checks.
+//   PARSER_MIN_PRICE_PCT (default 90)   PARSER_MIN_STOCK_PCT (default 75)
+function reportParserHealth(storeName, slug, products) {
+  const n = products.length;
+  const health = { storeName, slug, total: n, withPrice: 0, withStock: 0, ok: true, problems: [] };
+  if (n === 0) return health;
+
+  for (const p of products) {
+    if (/\d/.test(String(p.salePrice ?? ''))) health.withPrice++;
+    if (p.stockStatus) health.withStock++;
+  }
+  const pct = (x) => Math.round((x / n) * 100);
+  const minPrice = Number(process.env.PARSER_MIN_PRICE_PCT) || 90;
+  const minStock = Number(process.env.PARSER_MIN_STOCK_PCT) || 75;
+
+  if (n >= 10) { // tiny samples are too noisy to judge
+    if (pct(health.withPrice) < minPrice) {
+      health.problems.push(`price missing on ${n - health.withPrice}/${n} products (${100 - pct(health.withPrice)}%)`);
+    }
+    if (pct(health.withStock) < minStock) {
+      health.problems.push(`stock status missing on ${n - health.withStock}/${n} products (${100 - pct(health.withStock)}%)`);
+    }
+  }
+  health.ok = health.problems.length === 0;
+
+  if (health.ok) {
+    console.log(`     Health: price ${pct(health.withPrice)}% | stock ${pct(health.withStock)}% ✅`);
+  } else {
+    const msg = `PARSER HEALTH ${storeName}/${slug}: ${health.problems.join('; ')} — the ${storeName} parser probably needs a fix (site layout change?)`;
+    console.log(`  ⚠️  ${msg}`);
+    log('WARN', 'index.js', 'reportParserHealth', msg);
+  }
+  return health;
+}
+
 async function scrapeCategory(store, category, isCancelled = () => false, limit = createLimiter(DEFAULT_CONCURRENCY)) {
   const { name: storeName }    = store;
   const { slug, url: startUrl } = category;
@@ -176,7 +216,9 @@ async function scrapeCategory(store, category, isCancelled = () => false, limit 
   log('INFO', 'index.js', 'scrapeCategory',
     `${storeName}/${slug} complete${cancelled ? ' (cancelled)' : ''} — Saved: ${saved}, Failed: ${failed}, Total: ${doneCount}`);
 
-  return { done: doneCount, saved, failed, products, cancelled };
+  const health = reportParserHealth(storeName, slug, products);
+
+  return { done: doneCount, saved, failed, products, cancelled, health };
 }
 
 async function scrapeAll(stores = STORES, isCancelled = () => false) {
@@ -252,7 +294,7 @@ if (require.main === module) {
     });
 }
 
-module.exports = { scrapeAll, scrapeCategory };
+module.exports = { scrapeAll, scrapeCategory, reportParserHealth };
 
 
 
