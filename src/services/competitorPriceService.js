@@ -79,6 +79,8 @@ const STORE_SKU_FIELDS = {
   theitdepot: (p) => firstSku(p.model, p.sku),
   computechstore: (p) => firstSku(p.sku, p.modelNumber),
   varietyinfotech: (p) => firstSku(p.sku, p.modelNumber),
+  amazon: (p) => firstSku(p.modelNumber, p.partNumber),
+  elitehubs: (p) => firstSku(p.modelNumber, p.sku),
 };
  
 function extractSkuAndStock(product) {

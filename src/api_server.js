@@ -303,6 +303,11 @@ function findStoreByUrl(productUrl) {
     'vishalperipherals.com': 'vishal',
     'pcstudio.in'          : 'pcstudio',
     'fgtechstore.com'      : 'fgtech',
+    'theitdepot.com'       : 'theitdepot',
+    'computechstore.in'    : 'computechstore',
+    'varietyinfotech.com'  : 'varietyinfotech',
+    'amazon.in'            : 'amazon',
+    'elitehubs.com'        : 'elitehubs',
   };
   for (const [domain, storeName] of Object.entries(domainMap)) {
     if (productUrl.includes(domain)) {
