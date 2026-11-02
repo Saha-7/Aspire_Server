@@ -76,22 +76,28 @@ app.use(express.json({ limit: '2mb' }));
 // Trust proxy — required for secure cookies behind Azure's load balancer
 app.set('trust proxy', 1);
 
+const isProd = process.env.AZURE_ENV === 'production';
+
 app.use(session({
   secret           : process.env.SESSION_SECRET || 'dev-secret-change-in-prod',
   resave           : false,
   saveUninitialized: false,
   cookie: {
-    secure  : true,
-    sameSite: 'none',
+    secure  : isProd,
+    sameSite: isProd ? 'none' : 'lax',
     httpOnly: true,
     maxAge  : 24 * 60 * 60 * 1000, // 24 hours
   },
 }));
 
+console.log('🍪 session cookie config → secure:', false, '| sameSite: lax (local)');
 
 
 
 app.use('/api/sync', require('./routes/syncRoutes'));
+
+app.use('/api/salesperson-mapping', requireRole('admin'),
+        require('./routes/salespersonMappingRoutes')(getSqlPool));
 
 
 
