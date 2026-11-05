@@ -84,6 +84,28 @@ async function getMapping(filters = {}) {
   return groupBySalesperson(matches);
 }
 
+/**
+ * The (category, brand) pairs assigned to one salesperson — used by the
+ * role-based access scope. Only pairs where BOTH values are present count.
+ * Throws if the mapping can't be loaded (callers must fail closed).
+ */
+async function getAssignedPairsForEmail(email) {
+  const target = String(email || '').trim().toLowerCase();
+  if (!target) return [];
+  const rows = await loadRows();
+  const seen = new Set();
+  const pairs = [];
+  for (const r of rows) {
+    if (!r.email || r.email.toLowerCase() !== target) continue;
+    if (!r.category || !r.brand) continue;
+    const key = `${r.category}\u0001${r.brand}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    pairs.push({ category: r.category, brand: r.brand });
+  }
+  return pairs;
+}
+
 /** Distinct categories and brands for the two filter dropdowns. */
 async function getFilterOptions() {
   const rows = await loadRows();
@@ -131,4 +153,4 @@ function groupBySalesperson(rows) {
   );
 }
 
-module.exports = { getMapping, getFilterOptions };
+module.exports = { getMapping, getFilterOptions, getAssignedPairsForEmail };

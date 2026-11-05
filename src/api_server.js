@@ -48,6 +48,7 @@ const session        = require('express-session');
 const { msalClient } = require('./auth/msalConfig');
 const { requireAuth } = require('./auth/authMiddleware');
 const { requireRole } = require('./auth/authMiddleware');
+const { getUserScope, partitionSkus, requireWriteAccess } = require('./services/accessScope'); // category/brand RBAC
 
 const app  = express();
 const PORT = process.env.PORT || 8000;
@@ -76,6 +77,8 @@ app.use(express.json({ limit: '2mb' }));
 // Trust proxy — required for secure cookies behind Azure's load balancer
 app.set('trust proxy', 1);
 
+// Production (Azure, https, cross-site SWA -> App Service) needs secure + SameSite=None.
+// Local http://localhost needs secure:false + lax, otherwise the browser drops the cookie.
 const isProd = process.env.AZURE_ENV === 'production';
 
 app.use(session({
@@ -90,12 +93,12 @@ app.use(session({
   },
 }));
 
-console.log('🍪 session cookie config → secure:', false, '| sameSite: lax (local)');
 
 
 
 app.use('/api/sync', require('./routes/syncRoutes'));
 
+// Admin-only, read-only category/brand -> salesperson mapping (Settings tab)
 app.use('/api/salesperson-mapping', requireRole('admin'),
         require('./routes/salespersonMappingRoutes')(getSqlPool));
 
@@ -423,7 +426,7 @@ async function getNumericSetting(pool, key, fallback) {
 // ─────────────────────────────────────────────────────────────
 
 // ── GET /api/recommendations ──────────────────────────────────
-app.get('/api/recommendations', async (req, res) => {
+app.get('/api/recommendations', requireAuth, async (req, res) => {
   console.log('RECS ROUTE v2 (brand)');   // temporary
   let pool;
   try {
@@ -457,8 +460,10 @@ app.get('/api/recommendations', async (req, res) => {
         AND i.isInStock = 1 AND i.RecommendedSP IS NOT NULL
       ORDER BY i.SKU_ID
     `);
-    console.log(`✅ /api/recommendations — ${result.recordset.length} rows served`);
-    res.json({ success: true, data: result.recordset });
+    const scope = await getUserScope(req);
+    const visibleRows = scope.filterRows(result.recordset);
+    console.log(`✅ /api/recommendations — ${visibleRows.length} rows served`);
+    res.json({ success: true, data: visibleRows });
   } catch (err) {
     console.error('❌ API error:', err.message, '| line:', err.lineNumber);
     console.error('❌ API error:', err.message);
@@ -645,8 +650,10 @@ app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
       console.error('⚠️ Failed to persist RecommendedSP (non-fatal):', persistErr.message);
     }
 
-    console.log(`✅ /api/internal-recommendations — ${rows.length} eligible internal products (excluded ${competitorMatchedSkus.size} competitor-matched SKUs)`);
-    res.json({ success: true, data: rows });
+    const scope = await getUserScope(req);
+    const visibleRows = scope.filterRows(rows);
+    console.log(`✅ /api/internal-recommendations — ${visibleRows.length} rows served (${rows.length} eligible internal products, excluded ${competitorMatchedSkus.size} competitor-matched SKUs)`);
+    res.json({ success: true, data: visibleRows });
   } catch (err) {
     console.error('❌ /api/internal-recommendations error:', err.message);
     res.status(500).json({ success: false, error: err.message });
@@ -670,7 +677,7 @@ app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
 
 
 // ── POST /api/refresh-product ─────────────────────────────────
-app.post('/api/refresh-product', async (req, res) => {
+app.post('/api/refresh-product', requireAuth, requireWriteAccess, async (req, res) => {
   const { competitorUrl, skuId } = req.body;
   if (!competitorUrl || !skuId) {
     return res.status(400).json({ success: false, error: 'Both competitorUrl and skuId are required' });
@@ -688,6 +695,15 @@ app.post('/api/refresh-product', async (req, res) => {
 
   let pool;
   try {
+    // Role-based scope: check BEFORE spending a scrape on a SKU the user can't touch
+    const scope = await getUserScope(req);
+    if (!scope.unrestricted) {
+      const scopePool = await getSqlPool();
+      const { denied } = await partitionSkus(scopePool, scope, [skuId]);
+      if (denied.length) {
+        return res.status(403).json({ success: false, error: 'You are not assigned to this category/brand' });
+      }
+    }
     console.log(`   Scraping: ${competitorUrl}`);
     const product = await scrapeProduct(store, competitorUrl);
     if (!product || !product.name) {
@@ -703,7 +719,7 @@ app.post('/api/refresh-product', async (req, res) => {
     pool = await getSqlPool();
     const newRecommendedSP = await recalculateRecommendedSP(pool, skuId);
 
-    const refreshedBy = req.headers['x-user-email'] || 'manual';
+    const refreshedBy = req.session?.user?.email || req.headers['x-user-email'] || 'manual';
     const refreshedAt = new Date().toISOString();
 
     await pool.request()
@@ -732,13 +748,18 @@ app.post('/api/refresh-product', async (req, res) => {
 
 
 // ── GET /api/competitor-details/:skuId ───────────────────────
-app.get('/api/competitor-details/:skuId', async (req, res) => {
+app.get('/api/competitor-details/:skuId', requireAuth, async (req, res) => {
   const { skuId } = req.params;
   if (!skuId) return res.status(400).json({ success: false, error: 'skuId is required' });
 
   let pool;
   try {
     pool = await getSqlPool();
+    const scope = await getUserScope(req);
+    const { denied } = await partitionSkus(pool, scope, [skuId]);
+    if (denied.length) {
+      return res.status(403).json({ success: false, error: 'You are not assigned to this category/brand' });
+    }
     const result = await pool.request()
       .input('SKU', sql.NVarChar(100), skuId)
       .query(`
@@ -782,8 +803,10 @@ app.get('/api/pp-products', requireAuth, async (req, res) => {
       WHERE isActive = 1
       ORDER BY Category, Title
     `);
-    console.log(`✅ /api/pp-products — ${result.recordset.length} rows`);
-    res.json({ success: true, data: result.recordset });
+    const scope = await getUserScope(req);
+    const visibleRows = scope.filterRows(result.recordset);
+    console.log(`✅ /api/pp-products — ${visibleRows.length} rows`);
+    res.json({ success: true, data: visibleRows });
   } catch (err) {
     console.error('❌ /api/pp-products error:', err.message);
     res.status(500).json({ success: false, error: err.message });
@@ -796,7 +819,7 @@ app.get('/api/pp-products', requireAuth, async (req, res) => {
 
 
 // ── PATCH /api/update-pp ──────────────────────────────────────
-app.patch('/api/update-pp', requireAuth, async (req, res) => {
+app.patch('/api/update-pp', requireAuth, requireWriteAccess, async (req, res) => {
   const { skuId, newPP } = req.body;
   if (!skuId || newPP == null) {
     return res.status(400).json({ success: false, error: 'skuId and newPP are required' });
@@ -810,6 +833,11 @@ app.patch('/api/update-pp', requireAuth, async (req, res) => {
   let pool;
   try {
     pool = await getSqlPool();
+    const scope = await getUserScope(req);
+    const { denied } = await partitionSkus(pool, scope, [skuId]);
+    if (denied.length) {
+      return res.status(403).json({ success: false, error: 'You are not assigned to this category/brand' });
+    }
     const result = await pool.request()
       .input('SKU_ID',             sql.NVarChar(100),  skuId)
       .input('PP',                 sql.Decimal(10, 2), parsedPP)
@@ -865,6 +893,7 @@ app.get('/api/pp-template-csv', requireAuth, async (req, res) => {
 app.get('/api/insights', requireAuth, async (req, res) => {
   try {
     const pool = await getSqlPool();
+    const scope = await getUserScope(req);
     const { category, brand, alertType, search, days, sortBy, page, pageSize, minThreshold, skipRecompute, refresh } = req.query;
     const result = await getInsights(pool, {
       category: category || null,
@@ -878,6 +907,7 @@ app.get('/api/insights', requireAuth, async (req, res) => {
       minThresholdPct: minThreshold != null ? parseFloat(minThreshold) : null,
       skipRecompute: skipRecompute === 'true',
       forceRecompute: refresh === 'true',
+      scope,
     });
     res.json({ success: true, ...result });
   } catch (err) {
@@ -892,7 +922,8 @@ app.get('/api/insights', requireAuth, async (req, res) => {
 app.get('/api/insights/counts', requireAuth, async (req, res) => {
   try {
     const pool = await getSqlPool();
-    const counts = await getInsightCounts(pool, { days: req.query.days || null });
+    const scope = await getUserScope(req);
+    const counts = await getInsightCounts(pool, { days: req.query.days || null, scope });
     res.json({ success: true, ...counts });
   } catch (err) {
     console.error('❌ /api/insights/counts error:', err.message);
@@ -910,7 +941,9 @@ app.get('/api/insights/export.csv', requireAuth, async (req, res) => {
   }
   try {
     const pool = await getSqlPool();
+    const scope = await getUserScope(req);
     const exportData = await getInsightsExport(pool, {
+      scope,
       alertType,
       category: category || null,
       brand: brand || null,
@@ -956,12 +989,17 @@ app.get('/api/insights/take-action/:skuId', requireAuth, async (req, res) => {
 
     const productResult = await pool.request()
       .input('SKU_ID', sql.NVarChar(100), skuId)
-      .query(`SELECT SKU_ID, Title, Category, PP, SP FROM InternalProducts WHERE SKU_ID = @SKU_ID`);
+      .query(`SELECT SKU_ID, Title, Category, Brand, PP, SP FROM InternalProducts WHERE SKU_ID = @SKU_ID`);
 
     if (!productResult.recordset.length) {
       return res.status(404).json({ success: false, error: `SKU not found: ${skuId}` });
     }
     const product = productResult.recordset[0];
+
+    const scope = await getUserScope(req);
+    if (!scope.allows(product.Category, product.Brand)) {
+      return res.status(404).json({ success: false, error: `SKU not found: ${skuId}` });
+    }
 
     const competitorResult = await pool.request()
       .input('SKU_ID', sql.NVarChar(100), skuId)
@@ -1048,14 +1086,15 @@ app.get('/api/insights/take-action/:skuId', requireAuth, async (req, res) => {
 
 
 
-app.post('/api/insights/dismiss-bulk', requireAuth, async (req, res) => {
+app.post('/api/insights/dismiss-bulk', requireAuth, requireWriteAccess, async (req, res) => {
   try {
     const { ids } = req.body;
     if (!Array.isArray(ids) || ids.length === 0) {
       return res.status(400).json({ success: false, error: 'ids must be a non-empty array' });
     }
     const pool = await getSqlPool();
-    const dismissedIds = await bulkDismissInsights(pool, ids, req.session?.user?.email || req.user?.email || 'unknown');
+    const scope = await getUserScope(req);
+    const dismissedIds = await bulkDismissInsights(pool, ids, req.session?.user?.email || req.user?.email || 'unknown', scope);
     res.json({ success: true, data: dismissedIds });
   } catch (err) {
     console.error('❌ /api/insights/dismiss-bulk error:', err.message);
@@ -1067,14 +1106,15 @@ app.post('/api/insights/dismiss-bulk', requireAuth, async (req, res) => {
 
 
 // ── POST /api/insights/:id/dismiss ──────────────────────────────
-app.post('/api/insights/:id/dismiss', requireAuth, async (req, res) => {
+app.post('/api/insights/:id/dismiss', requireAuth, requireWriteAccess, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (isNaN(id)) return res.status(400).json({ success: false, error: 'Invalid alert id' });
   const dismissedBy = req.session?.user?.email || 'unknown';
   let pool;
   try {
     pool = await getSqlPool();
-    const updated = await dismissInsight(pool, id, dismissedBy);
+    const scope = await getUserScope(req);
+    const updated = await dismissInsight(pool, id, dismissedBy, scope);
     if (!updated) return res.status(404).json({ success: false, error: 'Alert not found' });
     res.json({ success: true, data: updated });
   } catch (err) {
@@ -1132,11 +1172,17 @@ app.post('/api/validate-skus', requireAuth, async (req, res) => {
       foundMap.set(row.SKU_ID.toLowerCase(), row.PP != null ? parseFloat(row.PP) : null);
     }
 
+    // Role-based scope: SKUs outside the user's category/brand are treated as
+    // "not found" (so the existing upload preview handles them, and nothing is revealed).
+    const scope = await getUserScope(req);
+    const { allowed: inScope } = await partitionSkus(pool, scope, [...foundMap.keys()]);
+    const inScopeSet = new Set(inScope.map(k => k.toLowerCase()));
+
     const valid    = [];
     const notFound = [];
 
     for (const sku of skus) {
-      if (foundMap.has(sku.toLowerCase())) {
+      if (foundMap.has(sku.toLowerCase()) && inScopeSet.has(sku.toLowerCase())) {
         valid.push({ sku, currentPP: foundMap.get(sku.toLowerCase()) });
       } else {
         notFound.push(sku);
@@ -1156,7 +1202,7 @@ app.post('/api/validate-skus', requireAuth, async (req, res) => {
 
 
 // ── POST /api/bulk-update-pp ──────────────────────────────────
-app.post('/api/bulk-update-pp', requireAuth, async (req, res) => {
+app.post('/api/bulk-update-pp', requireAuth, requireWriteAccess, async (req, res) => {
   const { rows = [], unidentified = [], fileName = '' } = req.body;
 
   if (rows.length === 0 && unidentified.length === 0) {
@@ -1189,6 +1235,16 @@ app.post('/api/bulk-update-pp', requireAuth, async (req, res) => {
   let pool;
   try {
     pool = await getSqlPool();
+
+    // Role-based scope: refuse the whole upload if any SKU is outside the user's assignments
+    const scope = await getUserScope(req);
+    const { denied } = await partitionSkus(pool, scope, rows.map(r => r.skuId));
+    if (denied.length) {
+      return res.status(403).json({
+        success: false,
+        error: `${denied.length} SKU(s) are not in your assigned categories/brands: ${denied.slice(0, 10).join(', ')}${denied.length > 10 ? ', …' : ''}. Nothing was updated.`,
+      });
+    }
 
     let updated = 0;
     for (const row of rows) {
@@ -1268,6 +1324,15 @@ app.post('/api/stock-snapshot', requireAuth, async (req, res) => {
     return res.status(400).json({ success: false, error: `Too many SKUs (${skus.length}). Maximum 10000.` });
   }
   try {
+    // Role-based scope: only SKUs the user is assigned to
+    const scope = await getUserScope(req);
+    if (!scope.unrestricted) {
+      const scopePool = await getSqlPool();
+      const { denied } = await partitionSkus(scopePool, scope, skus);
+      if (denied.length) {
+        return res.status(403).json({ success: false, error: `${denied.length} SKU(s) are not in your assigned categories/brands` });
+      }
+    }
     // Live per-item reads are limited by Shopify's API rate limit (and the 230s App Service
     // request timeout), so big exports use the last-synced DB view instead of live stock.
     const LIVE_MAX_SKUS = 500;
@@ -1293,7 +1358,7 @@ app.post('/api/stock-snapshot', requireAuth, async (req, res) => {
 // logged in. For each SKU it shows what the DB view says, what Shopify says
 // live, and the final per-location result the sheet would use.
 // NOTE: a "+" inside a SKU must be written as %2B in the URL.
-app.get('/api/stock-check', requireAuth, async (req, res) => {
+app.get('/api/stock-check', requireRole(['admin', 'supervisor']), async (req, res) => {
   const skus = [].concat(req.query.sku || []).map(s => String(s).trim()).filter(Boolean);
   if (skus.length === 0 || skus.length > 20) {
     return res.status(400).json({ success: false, error: 'Pass 1-20 SKUs, e.g. /api/stock-check?sku=YD3200C5FHBOX' });
@@ -1331,7 +1396,7 @@ app.get('/api/stock-check', requireAuth, async (req, res) => {
 // rows: [{ skuId, stock: { "<Location>": "<cell text>" } }]
 // Blank cell = 0. Diffs against live Shopify stock, pushes only the changes
 // to Shopify, and writes each change to InventoryUpdateLog.
-app.post('/api/bulk-update-stock', requireAuth, async (req, res) => {
+app.post('/api/bulk-update-stock', requireAuth, requireWriteAccess, async (req, res) => {
   const { rows = [], fileName = '', ppSessionId = null } = req.body;
 
   if (!Array.isArray(rows) || rows.length === 0) {
@@ -1350,6 +1415,17 @@ app.post('/api/bulk-update-stock', requireAuth, async (req, res) => {
   let pool;
   try {
     pool = await getSqlPool();
+
+    // Role-based scope: refuse the whole upload if any SKU is outside the user's assignments
+    const scope = await getUserScope(req);
+    const { denied } = await partitionSkus(pool, scope, rows.map(r => r.skuId));
+    if (denied.length) {
+      return res.status(403).json({
+        success: false,
+        error: `${denied.length} SKU(s) are not in your assigned categories/brands: ${denied.slice(0, 10).join(', ')}${denied.length > 10 ? ', …' : ''}. Nothing was changed.`,
+      });
+    }
+
     const result = await applyStockUpdates(pool, { rows, updatedBy, ppSessionId, fileName });
     res.json({ success: true, data: { ...result, updatedBy, updatedAt: new Date().toISOString() } });
   } catch (err) {
@@ -1500,7 +1576,7 @@ app.get('/api/app-settings/:key', requireAuth, async (req, res) => {
 
 
 // ── PUT /api/app-settings/:key ──────────────────────────────────
-app.put('/api/app-settings/:key', requireAuth, async (req, res) => {
+app.put('/api/app-settings/:key', requireAuth, requireWriteAccess, async (req, res) => {
   const { value } = req.body;
   if (value == null || value === '') {
     return res.status(400).json({ success: false, error: 'value is required' });
@@ -1578,7 +1654,7 @@ app.get('/api/category-settings', requireAuth, async (req, res) => {
 
 
 // ── PUT /api/category-settings/:category ─────────────────────
-app.put('/api/category-settings/:category', requireAuth, async (req, res) => {
+app.put('/api/category-settings/:category', requireAuth, requireWriteAccess, async (req, res) => {
   const categoryName = decodeURIComponent(req.params.category);
   const { GST, CostOfBusiness, ProfitMargin, PPLookbackDays, ScrapFreqDays, IsScrapEnabled } = req.body;
   const updatedBy = req.session?.user?.email || 'unknown';
@@ -1772,7 +1848,7 @@ app.delete('/api/users/:email', requireRole('admin'), async (req, res) => {
 // ── POST /api/run-recommendation-engine ───────────────────────
 const activeJobs = new Map();
 
-app.post('/api/run-recommendation-engine', requireAuth, async (req, res) => {
+app.post('/api/run-recommendation-engine', requireAuth, requireWriteAccess, async (req, res) => {
   const id         = uuidv4();
   const startedBy  = req.session?.user?.email || 'unknown';
 
@@ -2330,7 +2406,7 @@ app.delete('/api/category-mappings/:id', requireRole(['admin', 'supervisor']), a
 
 
 // ── POST /api/push-to-shopify ─────────────────────────────────
-app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
+app.post('/api/push-to-shopify', requireAuth, requireWriteAccess, async (req, res) => {
   const { skuId, sp, isManual, confirmVariance } = req.body;
 
   if (!skuId || sp == null) {
@@ -2349,12 +2425,17 @@ app.post('/api/push-to-shopify', requireAuth, async (req, res) => {
     // ── Variance check — against your own DB, before Shopify is touched at all ──
     const checkRow = await pool.request()
       .input('SKU_ID', sql.NVarChar(100), skuId)
-      .query(`SELECT RecommendedSP, SP FROM InternalProducts WHERE SKU_ID = @SKU_ID`); // ← added SP
+      .query(`SELECT RecommendedSP, SP, Category, Brand FROM InternalProducts WHERE SKU_ID = @SKU_ID`); // ← added SP (+ Category/Brand for RBAC)
 
     if (!checkRow.recordset.length) {
       return res.status(404).json({ success: false, error: `SKU not found: ${skuId}` });
     }
 
+    // Role-based scope: a salesperson can only push prices for their own category/brand
+    const scope = await getUserScope(req);
+    if (!scope.allows(checkRow.recordset[0].Category, checkRow.recordset[0].Brand)) {
+      return res.status(403).json({ success: false, error: 'You are not assigned to this category/brand' });
+    }
     const currentSP = checkRow.recordset[0].SP; // ← NEW: value before this push, for OldSellingPrice
     const systemSPRaw = checkRow.recordset[0].RecommendedSP;
     let systemSP = systemSPRaw != null ? parseFloat(systemSPRaw) : null;
