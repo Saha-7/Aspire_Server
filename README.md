@@ -145,3 +145,37 @@ tracked separately from the matching logic documented here.
    node .\src\discover-amazon-categories.js 1375344031
    node .\src\discover-amazon-categories.js 1375412031
 ```
+
+
+
+
+
+
+## Salesperson Mapping & Access Control
+
+**Admin panel (Settings → Salesperson Mapping, admin only, read-only)**
+- Shows which salesperson covers which category + brand.
+- Search by name/email, plus searchable Category and Brand dropdowns.
+- Long lists are collapsed ("+N more"). Sales users with no assignment show as "Unassigned".
+- Data comes from `vw_Shopify_Product_SKUs_With_SalesPerson` in the `db_returns` database (cached for 60 s). The mapping itself is maintained upstream, so nothing is edited in the app.
+- Needs `SELECT` on that view for your account (local) and the managed identity (production).
+
+**Role-based access (enforced on the server)**
+
+| Role | Can see | Can change |
+|---|---|---|
+| Admin / Supervisor | everything | everything |
+| Sales with assignments | only their category + brand pairs | only their own products |
+| Sales with no assignment | everything (read-only) | nothing |
+
+- Applies to Intelligence and Basic recommendations, Purchase Price Update, Insights (list, bell, counts, CSV) and competitor details.
+- Writes blocked for read-only users: push to Shopify, update PP, bulk PP/stock upload, refresh-product, dismiss alerts, Business Variables edits, recommendation engine, sync buttons.
+- If the mapping can't be loaded, a sales user's request fails; it never falls back to showing everything.
+
+**Also fixed along the way**
+- Login added to `/api/recommendations`, `/api/competitor-details` and `/api/refresh-product` (they were open), and to the `/api/sync/*` start routes.
+- Session cookie now switches by environment (`AZURE_ENV=production` → secure/none, local → lax).
+
+**Key files**
+- Server: `services/accessScope.js`, `services/salespersonMappingService.js`, `routes/salespersonMappingRoutes.js`, `services/Insightsservice.js`, `routes/syncRoutes.js`, `api_server.js`, plus `fetchSalespersonMappingRows` in `azureSqlService.js`
+- Client: `SalespersonMappingTab.jsx`, `SettingsView.jsx`, and two functions in `api.js`

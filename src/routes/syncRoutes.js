@@ -4,6 +4,8 @@
 const express = require('express');
 const { syncInternalProducts } = require('../internal_db_sync');
 const { syncSPOnly } = require('../sp_only_sync');
+const { requireAuth } = require('../auth/authMiddleware');
+const { requireWriteAccess } = require('../services/accessScope');
 
 const router = express.Router();
 
@@ -47,22 +49,21 @@ function runJob(name, fn) {
   return true;
 }
 
-// ── TODO: use the same auth middleware your other routes use ──
-// const { requireAuth } = require('../auth/...');
-// router.use(requireAuth);
+// Starting a sync changes data, so it needs a logged-in user who is not read-only.
+// (/status stays open: the UI polls it.)
 
-router.post('/internal', (req, res) => {
+router.post('/internal', requireAuth, requireWriteAccess, (req, res) => {
   const started = runJob('internal-products-sync', syncInternalProducts);
   res.status(started ? 202 : 409).json({ started, status: state });
 });
 
-router.post('/sp-only', (req, res) => {
+router.post('/sp-only', requireAuth, requireWriteAccess, (req, res) => {
   const started = runJob('sp-only-sync', syncSPOnly);
   res.status(started ? 202 : 409).json({ started, status: state });
 });
 
 // Both, in order: full sync first, then SP-only
-router.post('/all', (req, res) => {
+router.post('/all', requireAuth, requireWriteAccess, (req, res) => {
   const started = runJob('full-sync', async () => {
     const internal = await syncInternalProducts();
     const sp = await syncSPOnly();
