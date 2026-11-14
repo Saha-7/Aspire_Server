@@ -50,6 +50,10 @@ const { requireAuth } = require('./auth/authMiddleware');
 const { requireRole } = require('./auth/authMiddleware');
 const { getUserScope, partitionSkus, requireWriteAccess } = require('./services/accessScope'); // category/brand RBAC
 
+// Audit log (dbo.AuditEvents) — see src/audit/auditService.js
+const audit = require('./audit/auditService');
+const { MODULES, ACTIONS, SOURCES, STATUS } = audit;
+
 const app  = express();
 const PORT = process.env.PORT || 8000;
 
@@ -102,6 +106,10 @@ app.use('/api/sync', require('./routes/syncRoutes'));
 app.use('/api/salesperson-mapping', requireRole('admin'),
         require('./routes/salespersonMappingRoutes')(getSqlPool));
 
+// Admin-only audit log: filterable events + activity feed (read-only)
+app.use('/api/audit', requireRole('admin'),
+        require('./routes/auditRoutes')(getSqlPool));
+
 
 
 
@@ -125,21 +133,36 @@ app.get('/callback', async (req, res) => {
     const response = await msalClient.acquireTokenByCode(tokenRequest);
     const email = response.account.username.toLowerCase();
 
+    // Shared pool: never close it per request
     const pool = await getSqlPool();
     const roleResult = await pool.request()
       .input('Email', sql.NVarChar(255), email)
       .query(`SELECT Role FROM UserRoles WHERE Email = @Email`);
-    await pool.close();
+
+    const who = {
+      actorEmail: email,
+      actorName : response.account.name || null,
+      ipAddress : audit.clientIp(req),
+    };
 
     if (!roleResult.recordset.length) {
+      await audit.recordSafe(pool, {
+        ...who, module: MODULES.AUTH, action: ACTIONS.LOGIN_DENIED, source: SOURCES.UI,
+        status: STATUS.DENIED, entityType: 'USER', entityId: email,
+        summary: `Sign-in refused: ${email} is not in the system`,
+      });
       return res.status(403).send(`<h2>Access denied</h2><p>${email} is not in the system.</p>`);
     }
 
-    req.session.user = {
-      name : response.account.name,
-      email: email,
-      role : roleResult.recordset[0].Role,
-    };
+    const role = roleResult.recordset[0].Role;
+    req.session.user = { name: response.account.name, email, role };
+
+    await audit.recordSafe(pool, {
+      ...who, actorRole: role, module: MODULES.AUTH, action: ACTIONS.LOGIN, source: SOURCES.UI,
+      entityType: 'USER', entityId: email,
+      summary: `${response.account.name || email} signed in`,
+      details: { sessionId: req.sessionID },
+    });
 
     // Save session explicitly before redirecting
     req.session.save((err) => {
@@ -191,13 +214,26 @@ app.get('/auth/me', async (req, res) => {
       authenticated: true,
       user: req.session.user,
     });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
 // ── POST /auth/logout ─────────────────────────────────────────
-app.post('/auth/logout', (req, res) => {
+app.post('/auth/logout', async (req, res) => {
+  const u = req.session?.user;
+  const sessionId = req.sessionID;
+  if (u) {
+    try {
+      const pool = await getSqlPool();
+      await audit.recordSafe(pool, {
+        ...audit.actorFromReq(req), module: MODULES.AUTH, action: ACTIONS.LOGOUT, source: SOURCES.UI,
+        entityType: 'USER', entityId: u.email,
+        summary: `${u.name || u.email} signed out`,
+        details: { sessionId },
+      });
+    } catch (err) {
+      console.error('⚠️ logout audit skipped:', err.message);
+    }
+  }
   req.session.destroy();
   res.json({ success: true });
 });
@@ -468,8 +504,6 @@ app.get('/api/recommendations', requireAuth, async (req, res) => {
     console.error('❌ API error:', err.message, '| line:', err.lineNumber);
     console.error('❌ API error:', err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -657,8 +691,6 @@ app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('❌ /api/internal-recommendations error:', err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -734,6 +766,12 @@ app.post('/api/refresh-product', requireAuth, requireWriteAccess, async (req, re
       `);
 
     console.log(`   ✅ Done — RecommendedSP: ₹${newRecommendedSP} | RefreshedBy: ${refreshedBy}`);
+    await audit.recordSafe(pool, {
+      ...audit.actorFromReq(req), module: MODULES.SCRAPER, action: ACTIONS.REFRESH, source: SOURCES.UI,
+      entityType: 'SKU', entityId: skuId, fieldName: 'RecommendedSP', newValue: newRecommendedSP,
+      summary: `Manual refresh of ${skuId} from ${store.name}: competitor price ${upserted.CompetitorPrice ?? 'n/a'}, recommended SP ${newRecommendedSP ?? 'n/a'}`,
+      details: { competitorUrl, store: store.name, competitorPrice: upserted.CompetitorPrice ?? null },
+    });
     res.json({
       success: true, skuId, storeName: store.name, productName: product.name,
       newCompetitorPrice: upserted.CompetitorPrice, newRecommendedSP, refreshedAt, refreshedBy,
@@ -741,8 +779,6 @@ app.post('/api/refresh-product', requireAuth, requireWriteAccess, async (req, re
   } catch (err) {
     console.error(`❌ Manual refresh failed: ${err.message}`);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -773,8 +809,6 @@ app.get('/api/competitor-details/:skuId', requireAuth, async (req, res) => {
   } catch (err) {
     console.error(`❌ /api/competitor-details/${skuId}:`, err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -810,8 +844,6 @@ app.get('/api/pp-products', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('❌ /api/pp-products error:', err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -831,14 +863,34 @@ app.patch('/api/update-pp', requireAuth, requireWriteAccess, async (req, res) =>
 
   const updatedBy = req.session?.user?.email || 'unknown';
   let pool;
+  let tx = null;
   try {
     pool = await getSqlPool();
     const scope = await getUserScope(req);
     const { denied } = await partitionSkus(pool, scope, [skuId]);
     if (denied.length) {
+      await audit.recordSafe(pool, {
+        ...audit.actorFromReq(req), module: MODULES.PURCHASE_PRICE, action: ACTIONS.UPDATE, source: SOURCES.UI,
+        status: STATUS.DENIED, entityType: 'SKU', entityId: skuId, fieldName: 'PP', newValue: parsedPP,
+        summary: `Blocked: tried to set PP of ${skuId} to ${parsedPP} (not assigned to this category/brand)`,
+      });
       return res.status(403).json({ success: false, error: 'You are not assigned to this category/brand' });
     }
-    const result = await pool.request()
+
+    // Change + audit row commit together (or not at all)
+    tx = new sql.Transaction(pool);
+    await tx.begin();
+
+    const before = await tx.request()
+      .input('SKU_ID', sql.NVarChar(100), skuId)
+      .query(`SELECT PP, Category, Brand FROM InternalProducts WHERE SKU_ID = @SKU_ID`);
+    if (!before.recordset.length) {
+      await tx.rollback(); tx = null;
+      return res.status(404).json({ success: false, error: `SKU not found: ${skuId}` });
+    }
+    const old = before.recordset[0];
+
+    const result = await tx.request()
       .input('SKU_ID',             sql.NVarChar(100),  skuId)
       .input('PP',                 sql.Decimal(10, 2), parsedPP)
       .input('ManualPP_UpdatedBy', sql.NVarChar(150),  updatedBy)
@@ -851,16 +903,20 @@ app.patch('/api/update-pp', requireAuth, requireWriteAccess, async (req, res) =>
         FROM InternalProducts WHERE SKU_ID = @SKU_ID;
       `);
 
-    if (!result.recordset.length) {
-      return res.status(404).json({ success: false, error: `SKU not found: ${skuId}` });
-    }
+    await audit.record(tx, {
+      ...audit.actorFromReq(req), module: MODULES.PURCHASE_PRICE, action: ACTIONS.UPDATE, source: SOURCES.UI,
+      entityType: 'SKU', entityId: skuId, category: old.Category, brand: old.Brand,
+      fieldName: 'PP', oldValue: old.PP, newValue: parsedPP,
+      summary: `PP of ${skuId} changed from ${old.PP ?? 'none'} to ${parsedPP}`,
+    });
+    await tx.commit(); tx = null;
+
     console.log(`✅ PP updated: SKU=${skuId} | PP=₹${parsedPP} | By=${updatedBy}`);
     res.json({ success: true, data: result.recordset[0] });
   } catch (err) {
+    if (tx) { try { await tx.rollback(); } catch (_) {} }
     console.error(`❌ /api/update-pp error for ${skuId}:`, err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -1065,8 +1121,6 @@ app.get('/api/insights/take-action/:skuId', requireAuth, async (req, res) => {
   } catch (err) {
     console.error(`❌ /api/insights/take-action/${skuId} error:`, err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -1094,7 +1148,38 @@ app.post('/api/insights/dismiss-bulk', requireAuth, requireWriteAccess, async (r
     }
     const pool = await getSqlPool();
     const scope = await getUserScope(req);
+
+    // State BEFORE the dismiss (see single-dismiss route)
+    const numericIds = ids.map(Number).filter(Number.isInteger);
+    const beforeRes = await pool.request()
+      .input('Ids', sql.NVarChar(sql.MAX), JSON.stringify(numericIds))
+      .query(`SELECT Id, SKU_ID, AlertType, Category, Status, DismissedBy, DismissedAt
+              FROM InsightAlerts WHERE Id IN (SELECT CAST(value AS INT) FROM OPENJSON(@Ids))`);
+    const beforeById = new Map(beforeRes.recordset.map(r => [r.Id, r]));
+
     const dismissedIds = await bulkDismissInsights(pool, ids, req.session?.user?.email || req.user?.email || 'unknown', scope);
+
+    if (dismissedIds.length) {
+      const actor = audit.actorFromReq(req);
+      const batchId = uuidv4();
+      const events = dismissedIds.map(aid => {
+        const b = beforeById.get(aid) || {};
+        return {
+          ...actor, module: MODULES.INSIGHTS, action: ACTIONS.DISMISS, source: SOURCES.UI,
+          entityType: 'ALERT', entityId: b.SKU_ID, category: b.Category,
+          fieldName: 'Status', oldValue: b.Status, newValue: 'dismissed',
+          summary: `Dismissed ${b.AlertType || 'alert'} for ${b.SKU_ID || aid}`,
+          batchId, details: { alertId: aid, alertType: b.AlertType, previouslyDismissedBy: b.DismissedBy || null, previouslyDismissedAt: b.DismissedAt || null },
+        };
+      });
+      events.unshift({
+        ...actor, module: MODULES.INSIGHTS, action: ACTIONS.BULK_DISMISS, source: SOURCES.UI,
+        entityType: 'BATCH', entityId: `${dismissedIds.length} alerts`, batchId,
+        summary: `Dismissed ${dismissedIds.length} insight alert${dismissedIds.length === 1 ? '' : 's'}${ids.length !== dismissedIds.length ? ` (${ids.length - dismissedIds.length} skipped)` : ''}`,
+        details: { requested: ids.length, dismissed: dismissedIds.length },
+      });
+      await audit.recordSafe(pool, events);
+    }
     res.json({ success: true, data: dismissedIds });
   } catch (err) {
     console.error('❌ /api/insights/dismiss-bulk error:', err.message);
@@ -1114,8 +1199,25 @@ app.post('/api/insights/:id/dismiss', requireAuth, requireWriteAccess, async (re
   try {
     pool = await getSqlPool();
     const scope = await getUserScope(req);
+
+    // State BEFORE the dismiss — dismissing overwrites DismissedBy/At for everyone, so keep the history here
+    const before = await pool.request().input('Id', sql.Int, id).query(
+      `SELECT Status, DismissedBy, DismissedAt, Category FROM InsightAlerts WHERE Id = @Id`);
+    const prev = before.recordset[0] || {};
+
     const updated = await dismissInsight(pool, id, dismissedBy, scope);
     if (!updated) return res.status(404).json({ success: false, error: 'Alert not found' });
+
+    await audit.recordSafe(pool, {
+      ...audit.actorFromReq(req), module: MODULES.INSIGHTS, action: ACTIONS.DISMISS, source: SOURCES.UI,
+      entityType: 'ALERT', entityId: updated.SKU_ID, category: prev.Category,
+      fieldName: 'Status', oldValue: prev.Status, newValue: updated.Status,
+      summary: `Dismissed ${updated.AlertType} alert for ${updated.SKU_ID}`,
+      details: {
+        alertId: id, alertType: updated.AlertType,
+        previouslyDismissedBy: prev.DismissedBy || null, previouslyDismissedAt: prev.DismissedAt || null,
+      },
+    });
     res.json({ success: true, data: updated });
   } catch (err) {
     console.error('❌ /api/insights/:id/dismiss error:', err.message);
@@ -1195,8 +1297,6 @@ app.post('/api/validate-skus', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('❌ /api/validate-skus error:', err.message, err.stack);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -1230,9 +1330,10 @@ app.post('/api/bulk-update-pp', requireAuth, requireWriteAccess, async (req, res
 
   const updatedBy = req.session?.user?.email || 'unknown';
   const updatedAt = new Date().toISOString();
-  const sessionId = uuidv4();
+  const sessionId = uuidv4(); // also used as the audit BatchId
 
   let pool;
+  let tx = null;
   try {
     pool = await getSqlPool();
 
@@ -1240,27 +1341,60 @@ app.post('/api/bulk-update-pp', requireAuth, requireWriteAccess, async (req, res
     const scope = await getUserScope(req);
     const { denied } = await partitionSkus(pool, scope, rows.map(r => r.skuId));
     if (denied.length) {
+      await audit.recordSafe(pool, {
+        ...audit.actorFromReq(req), module: MODULES.PURCHASE_PRICE, action: ACTIONS.BULK_UPLOAD, source: SOURCES.CSV_UPLOAD,
+        status: STATUS.DENIED, entityType: 'FILE', entityId: fileName || '(unnamed file)', batchId: sessionId,
+        summary: `Blocked PP upload "${fileName || 'unnamed'}": ${denied.length} SKU(s) outside the user's assigned categories/brands`,
+        details: { deniedCount: denied.length, deniedSample: denied.slice(0, 20) },
+      });
       return res.status(403).json({
         success: false,
         error: `${denied.length} SKU(s) are not in your assigned categories/brands: ${denied.slice(0, 10).join(', ')}${denied.length > 10 ? ', …' : ''}. Nothing was updated.`,
       });
     }
 
-    let updated = 0;
+    // Everything below (updates + session rows + audit rows) is ONE transaction
+    tx = new sql.Transaction(pool);
+    await tx.begin();
+
+    // Values BEFORE the upload, for the audit trail
+    const meta = await audit.getSkuMeta(tx, rows.map(r => r.skuId));
+    const currentPP = new Map([...meta].map(([k, v]) => [k, v.pp])); // running value (handles duplicate SKUs in one CSV)
+
+    const events = [];
+    const actor = audit.actorFromReq(req);
+    let updated = 0, unchanged = 0, notFound = 0;
+
     for (const row of rows) {
-      const result = await pool.request()
+      const newPP = parseFloat(row.newPP);
+      const result = await tx.request()
         .input('SKU_ID',    sql.NVarChar(100),  row.skuId)
-        .input('PP',        sql.Decimal(10, 2), parseFloat(row.newPP))
+        .input('PP',        sql.Decimal(10, 2), newPP)
         .input('UpdatedBy', sql.NVarChar(150),  updatedBy)
         .query(`
           UPDATE InternalProducts
           SET PP = @PP, ManualPP_UpdatedAt = GETDATE(), ManualPP_UpdatedBy = @UpdatedBy
           WHERE SKU_ID = @SKU_ID
         `);
-      if (result.rowsAffected[0] > 0) updated++;
+      if (result.rowsAffected[0] === 0) { notFound++; continue; }
+      updated++;
+
+      const key = audit.normSku(row.skuId);
+      const m = meta.get(key) || {};
+      const oldPP = currentPP.get(key);
+      currentPP.set(key, newPP);
+      if (oldPP !== null && oldPP !== undefined && Number(oldPP) === newPP) { unchanged++; continue; } // no real change → no audit noise
+
+      events.push({
+        ...actor, module: MODULES.PURCHASE_PRICE, action: ACTIONS.UPDATE, source: SOURCES.CSV_UPLOAD,
+        entityType: 'SKU', entityId: row.skuId, category: m.category, brand: m.brand,
+        fieldName: 'PP', oldValue: oldPP, newValue: newPP,
+        summary: `PP of ${row.skuId} changed from ${oldPP ?? 'none'} to ${newPP} (CSV upload)`,
+        batchId: sessionId, details: { fileName },
+      });
     }
 
-    await pool.request()
+    await tx.request()
       .input('SessionID',         sql.NVarChar(36),  sessionId)
       .input('UploadedBy',        sql.NVarChar(150), updatedBy)
       .input('TotalRowsInCSV',    sql.Int,           rows.length + unidentified.length)
@@ -1278,7 +1412,7 @@ app.post('/api/bulk-update-pp', requireAuth, requireWriteAccess, async (req, res
       const BATCH = 50;
       for (let i = 0; i < unidentified.length; i += BATCH) {
         const batch  = unidentified.slice(i, i + BATCH);
-        const req2   = pool.request();
+        const req2   = tx.request();
         const values = batch.map((row, idx) => {
           const n = i + idx;
           req2.input(`sid${n}`,  sql.NVarChar(36),   sessionId);
@@ -1294,6 +1428,18 @@ app.post('/api/bulk-update-pp', requireAuth, requireWriteAccess, async (req, res
       }
     }
 
+    // One summary row for the upload + one row per changed SKU (all share BatchId = sessionId)
+    events.unshift({
+      ...actor, module: MODULES.PURCHASE_PRICE, action: ACTIONS.BULK_UPLOAD, source: SOURCES.CSV_UPLOAD,
+      entityType: 'FILE', entityId: fileName || '(unnamed file)', batchId: sessionId,
+      summary: `PP upload "${fileName || 'unnamed'}": ${events.length} changed, ${unchanged} unchanged, ${unidentified.length} unidentified`,
+      details: { fileName, totalRows: rows.length + unidentified.length, matched: updated, changed: events.length,
+                 unchanged, notFound, unidentified: unidentified.length },
+    });
+    await audit.recordMany(tx, events);
+
+    await tx.commit(); tx = null;
+
     console.log(`✅ /api/bulk-update-pp — session=${sessionId} | updated=${updated} | unidentified=${unidentified.length} | by=${updatedBy}`);
 
     res.json({
@@ -1302,10 +1448,16 @@ app.post('/api/bulk-update-pp', requireAuth, requireWriteAccess, async (req, res
     });
 
   } catch (err) {
+    if (tx) { try { await tx.rollback(); } catch (_) {} }
     console.error('❌ /api/bulk-update-pp error:', err.message, err.stack);
+    if (pool) {
+      await audit.recordSafe(pool, {
+        ...audit.actorFromReq(req), module: MODULES.PURCHASE_PRICE, action: ACTIONS.BULK_UPLOAD, source: SOURCES.CSV_UPLOAD,
+        status: STATUS.FAILED, entityType: 'FILE', entityId: fileName || '(unnamed file)', batchId: sessionId,
+        summary: `PP upload "${fileName || 'unnamed'}" failed, nothing was changed: ${err.message}`,
+      });
+    }
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -1420,6 +1572,12 @@ app.post('/api/bulk-update-stock', requireAuth, requireWriteAccess, async (req, 
     const scope = await getUserScope(req);
     const { denied } = await partitionSkus(pool, scope, rows.map(r => r.skuId));
     if (denied.length) {
+      await audit.recordSafe(pool, {
+        ...audit.actorFromReq(req), module: MODULES.STOCK, action: ACTIONS.BULK_UPLOAD, source: SOURCES.CSV_UPLOAD,
+        status: STATUS.DENIED, entityType: 'FILE', entityId: fileName || '(unnamed file)',
+        summary: `Blocked stock upload "${fileName || 'unnamed'}": ${denied.length} SKU(s) outside the user's assigned categories/brands`,
+        details: { deniedCount: denied.length, deniedSample: denied.slice(0, 20), ppSessionId },
+      });
       return res.status(403).json({
         success: false,
         error: `${denied.length} SKU(s) are not in your assigned categories/brands: ${denied.slice(0, 10).join(', ')}${denied.length > 10 ? ', …' : ''}. Nothing was changed.`,
@@ -1427,9 +1585,44 @@ app.post('/api/bulk-update-stock', requireAuth, requireWriteAccess, async (req, 
     }
 
     const result = await applyStockUpdates(pool, { rows, updatedBy, ppSessionId, fileName });
+
+    // Audit AFTER the Shopify push (an external call can't be rolled back, so we record what actually happened)
+    const actor = audit.actorFromReq(req);
+    const meta  = await audit.getSkuMeta(pool, (result.changes || []).map(c => c.sku)).catch(() => new Map());
+    const events = (result.changes || []).map(c => {
+      const m = meta.get(audit.normSku(c.sku)) || {};
+      const ok = c.status === 'Pushed';
+      return {
+        ...actor, module: MODULES.STOCK, action: ACTIONS.UPDATE, source: SOURCES.CSV_UPLOAD,
+        status: ok ? STATUS.SUCCESS : STATUS.FAILED,
+        entityType: 'SKU', entityId: c.sku, category: m.category, brand: m.brand,
+        fieldName: `Stock - ${c.location}`, oldValue: c.oldQty, newValue: c.newQty,
+        summary: ok
+          ? `Stock of ${c.sku} at ${c.location} changed from ${c.oldQty ?? 'inactive'} to ${c.newQty}`
+          : `FAILED to change stock of ${c.sku} at ${c.location} (${c.oldQty ?? 'inactive'} → ${c.newQty})`,
+        batchId: result.sessionId, details: { fileName, ppSessionId },
+      };
+    });
+    events.unshift({
+      ...actor, module: MODULES.STOCK, action: ACTIONS.BULK_UPLOAD, source: SOURCES.CSV_UPLOAD,
+      status: result.failed > 0 ? STATUS.PARTIAL : STATUS.SUCCESS,
+      entityType: 'FILE', entityId: fileName || '(unnamed file)', batchId: result.sessionId,
+      summary: `Stock upload "${fileName || 'unnamed'}": ${result.pushed} pushed, ${result.failed} failed, ${result.unchanged} unchanged`,
+      details: { fileName, ppSessionId, changed: result.changed, pushed: result.pushed, failed: result.failed, unchanged: result.unchanged },
+    });
+    await audit.recordSafe(pool, events);
+
     res.json({ success: true, data: { ...result, updatedBy, updatedAt: new Date().toISOString() } });
   } catch (err) {
     console.error('❌ /api/bulk-update-stock error:', err.message, err.stack);
+    if (pool) {
+      await audit.recordSafe(pool, {
+        ...audit.actorFromReq(req), module: MODULES.STOCK, action: ACTIONS.BULK_UPLOAD, source: SOURCES.CSV_UPLOAD,
+        status: STATUS.FAILED, entityType: 'FILE', entityId: fileName || '(unnamed file)',
+        summary: `Stock upload "${fileName || 'unnamed'}" failed: ${String(err.message).slice(0, 300)}`,
+        details: { fileName, ppSessionId },
+      });
+    }
     const known = (err.status && err.status < 500) || err.status === 502;
     res.status(err.status || 500).json({
       success: false,
@@ -1437,8 +1630,6 @@ app.post('/api/bulk-update-stock', requireAuth, requireWriteAccess, async (req, 
       technical: err.technical || (known ? undefined : err.message),
       details: err.details,
     });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -1472,8 +1663,6 @@ app.get('/api/bulk-upload-history', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('❌ /api/bulk-upload-history error:', err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -1496,8 +1685,6 @@ app.get('/api/bulk-upload-session/:sessionId/unidentified', requireAuth, async (
   } catch (err) {
     console.error(`❌ /api/bulk-upload-session/${sessionId}/unidentified:`, err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -1539,8 +1726,6 @@ app.get('/api/bulk-upload-session/:sessionId/export', requireAuth, async (req, r
   } catch (err) {
     console.error(`❌ /api/bulk-upload-session/${sessionId}/export:`, err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -1566,8 +1751,6 @@ app.get('/api/app-settings/:key', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('❌ /api/app-settings GET error:', err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -1584,9 +1767,17 @@ app.put('/api/app-settings/:key', requireAuth, requireWriteAccess, async (req, r
 
   const updatedBy = req.session?.user?.email || 'unknown';
   let pool;
+  let tx = null;
   try {
     pool = await getSqlPool();
-    const result = await pool.request()
+    tx = new sql.Transaction(pool);
+    await tx.begin();
+
+    const before = await tx.request()
+      .input('Key', sql.NVarChar(100), req.params.key)
+      .query(`SELECT SettingValue FROM AppSettings WHERE SettingKey = @Key`);
+
+    const result = await tx.request()
       .input('Key',       sql.NVarChar(100), req.params.key)
       .input('Value',     sql.NVarChar(100), String(value))
       .input('UpdatedBy', sql.NVarChar(150), updatedBy)
@@ -1598,15 +1789,24 @@ app.put('/api/app-settings/:key', requireAuth, requireWriteAccess, async (req, r
       `);
 
     if (!result.recordset.length) {
+      await tx.rollback(); tx = null;
       return res.status(404).json({ success: false, error: `Setting not found: ${req.params.key}` });
     }
+    const oldValue = before.recordset[0]?.SettingValue;
+    await audit.record(tx, {
+      ...audit.actorFromReq(req), module: MODULES.BUSINESS_VARS, action: ACTIONS.UPDATE, source: SOURCES.UI,
+      entityType: 'SETTING', entityId: req.params.key, fieldName: req.params.key,
+      oldValue, newValue: String(value),
+      summary: `Setting "${req.params.key}" changed from ${oldValue ?? 'none'} to ${value}`,
+    });
+    await tx.commit(); tx = null;
+
     console.log(`✅ /api/app-settings/${req.params.key} updated to ${value} by ${updatedBy}`);
     res.json({ success: true, data: result.recordset[0] });
   } catch (err) {
+    if (tx) { try { await tx.rollback(); } catch (_) {} }
     console.error('❌ /api/app-settings PUT error:', err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -1641,8 +1841,6 @@ app.get('/api/category-settings', requireAuth, async (req, res) => {
     res.json({ success: true, data: result.recordset });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -1691,10 +1889,20 @@ app.put('/api/category-settings/:category', requireAuth, requireWriteAccess, asy
   }
 
   let pool;
+  let tx = null;
   try {
     pool = await getSqlPool();
+    tx = new sql.Transaction(pool);
+    await tx.begin();
 
-    const result = await pool.request()
+    const FIELDS = ['GST', 'CostOfBusiness', 'ProfitMargin', 'PPLookbackDays', 'ScrapFreqDays', 'IsScrapEnabled'];
+    const oldRes = await tx.request()
+      .input('CategoryName', sql.NVarChar(200), categoryName)
+      .query(`SELECT GST, CostOfBusiness, ProfitMargin, PPLookbackDays, ScrapFreqDays, IsScrapEnabled
+              FROM CategorySettings WHERE CategoryName = @CategoryName`);
+    const oldRow = oldRes.recordset[0] || null;
+
+    const result = await tx.request()
       .input('CategoryName',    sql.NVarChar(200),  categoryName)
       .input('GST',             sql.Decimal(5, 2),  GST            ?? null)
       .input('CostOfBusiness',  sql.Decimal(5, 2),  CostOfBusiness ?? null)
@@ -1731,11 +1939,28 @@ app.put('/api/category-settings/:category', requireAuth, requireWriteAccess, asy
         WHERE CategoryName = @CategoryName;
       `);
 
-    res.json({ success: true, data: result.recordset[0] });
+    // Field-by-field before/after (one audit row per save; the list goes in Details.changes)
+    const norm = (v) => (v === null || v === undefined ? null : typeof v === 'boolean' ? (v ? 1 : 0) : Number(v));
+    const newRow = result.recordset[0];
+    const changes = FIELDS
+      .map((f) => ({ field: f, old: oldRow ? norm(oldRow[f]) : null, new: norm(newRow[f]) }))
+      .filter((c) => !oldRow || c.old !== c.new);
+    const text = changes.map((c) => `${c.field} ${c.old ?? 'none'} → ${c.new ?? 'none'}`).join(', ');
+
+    await audit.record(tx, {
+      ...audit.actorFromReq(req), module: MODULES.BUSINESS_VARS, action: oldRow ? ACTIONS.UPDATE : ACTIONS.CREATE, source: SOURCES.UI,
+      entityType: 'CATEGORY', entityId: categoryName, category: categoryName,
+      summary: oldRow
+        ? `Category settings for ${categoryName}: ${text || 'saved, no values changed'}`
+        : `Category settings created for ${categoryName}: ${text}`,
+      details: { changes },
+    });
+    await tx.commit(); tx = null;
+
+    res.json({ success: true, data: newRow });
   } catch (err) {
+    if (tx) { try { await tx.rollback(); } catch (_) {} }
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -1764,8 +1989,6 @@ app.get('/api/users', requireRole('admin'), async (req, res) => {
   } catch (err) {
     console.error('❌ /api/users GET error:', err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -1784,9 +2007,18 @@ app.post('/api/users', requireRole('admin'), async (req, res) => {
 
   const addedBy = req.session.user.email;
   let pool;
+  let tx = null;
   try {
     pool = await getSqlPool();
-    await pool.request()
+    tx = new sql.Transaction(pool);
+    await tx.begin();
+
+    const prev = await tx.request()
+      .input('Email', sql.NVarChar(255), normalizedEmail)
+      .query(`SELECT Role FROM UserRoles WHERE Email = @Email`);
+    const oldRole = prev.recordset[0]?.Role ?? null;
+
+    await tx.request()
       .input('Email',   sql.NVarChar(255), normalizedEmail)
       .input('Role',    sql.NVarChar(50),  role)
       .input('AddedBy', sql.NVarChar(255), addedBy)
@@ -1804,13 +2036,21 @@ app.post('/api/users', requireRole('admin'), async (req, res) => {
           VALUES (@Email, @Role, @AddedBy);
       `);
 
+    await audit.record(tx, {
+      ...audit.actorFromReq(req), module: MODULES.USERS, action: oldRole ? ACTIONS.UPDATE : ACTIONS.CREATE, source: SOURCES.UI,
+      entityType: 'USER', entityId: normalizedEmail, fieldName: 'Role', oldValue: oldRole, newValue: role,
+      summary: oldRole
+        ? `Role of ${normalizedEmail} changed from ${oldRole} to ${role}`
+        : `Added ${normalizedEmail} as ${role}`,
+    });
+    await tx.commit(); tx = null;
+
     console.log(`✅ /api/users — upserted: ${normalizedEmail} as ${role} by ${addedBy}`);
     res.json({ success: true, data: { email: normalizedEmail, role } });
   } catch (err) {
+    if (tx) { try { await tx.rollback(); } catch (_) {} }
     console.error('❌ /api/users POST error:', err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -1825,22 +2065,37 @@ app.delete('/api/users/:email', requireRole('admin'), async (req, res) => {
   }
 
   let pool;
+  let tx = null;
   try {
     pool = await getSqlPool();
-    const result = await pool.request()
+    tx = new sql.Transaction(pool);
+    await tx.begin();
+
+    const prev = await tx.request()
+      .input('Email', sql.NVarChar(255), targetEmail)
+      .query(`SELECT Role FROM UserRoles WHERE Email = @Email`);
+    const result = await tx.request()
       .input('Email', sql.NVarChar(255), targetEmail)
       .query(`DELETE FROM UserRoles WHERE Email = @Email`);
 
     if (result.rowsAffected[0] === 0) {
+      await tx.rollback(); tx = null;
       return res.status(404).json({ success: false, error: 'User not found' });
     }
+    const oldRole = prev.recordset[0]?.Role ?? null;
+    await audit.record(tx, {
+      ...audit.actorFromReq(req), module: MODULES.USERS, action: ACTIONS.DELETE, source: SOURCES.UI,
+      entityType: 'USER', entityId: targetEmail, fieldName: 'Role', oldValue: oldRole, newValue: null,
+      summary: `Removed access for ${targetEmail} (was ${oldRole ?? 'unknown role'})`,
+    });
+    await tx.commit(); tx = null;
+
     console.log(`✅ /api/users DELETE — removed: ${targetEmail} by ${selfEmail}`);
     res.json({ success: true });
   } catch (err) {
+    if (tx) { try { await tx.rollback(); } catch (_) {} }
     console.error(`❌ /api/users DELETE error:`, err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -1871,6 +2126,13 @@ app.post('/api/run-recommendation-engine', requireAuth, requireWriteAccess, asyn
 
   console.log(`🚀 Recommendation engine triggered by ${startedBy} | job=${id}`);
 
+  const engineActor = audit.actorFromReq(req);
+  getSqlPool().then(p => audit.recordSafe(p, {
+    ...engineActor, module: MODULES.SCRAPER, action: ACTIONS.TRIGGER, source: SOURCES.UI,
+    entityType: 'JOB', entityId: id, summary: 'Started the recommendation engine (recalculates recommended prices)',
+    details: { jobId: id, job: 'recommendation-engine' },
+  })).catch(() => {});
+
   (async () => {
     const job = activeJobs.get(id);
     try {
@@ -1882,11 +2144,15 @@ app.post('/api/run-recommendation-engine', requireAuth, requireWriteAccess, asyn
       const competitorMap    = buildCompetitorMap(competitorRows);
       const recommendations  = generateRecommendations(internalProducts, competitorMap, categorySettings);
       await updateRecommendedSP(pool, recommendations);
-      await pool.close();
 
       job.status       = 'done';
       job.updatedCount = recommendations.length;
       job.finishedAt   = new Date().toISOString();
+      await audit.recordSafe(pool, {
+        ...engineActor, module: MODULES.SCRAPER, action: ACTIONS.FINISH, source: SOURCES.SYSTEM,
+        entityType: 'JOB', entityId: id, summary: `Recommendation engine finished: ${recommendations.length} recommended prices recalculated`,
+        details: { jobId: id, job: 'recommendation-engine', updatedCount: recommendations.length },
+      });
       console.log(`✅ Recommendation engine done | job=${id} | updated=${recommendations.length}`);
 
     } catch (err) {
@@ -1894,6 +2160,13 @@ app.post('/api/run-recommendation-engine', requireAuth, requireWriteAccess, asyn
       job.error      = err.message;
       job.finishedAt = new Date().toISOString();
       console.error(`❌ Recommendation engine failed | job=${id}:`, err.message);
+      try {
+        await audit.recordSafe(await getSqlPool(), {
+          ...engineActor, module: MODULES.SCRAPER, action: ACTIONS.FINISH, source: SOURCES.SYSTEM, status: STATUS.FAILED,
+          entityType: 'JOB', entityId: id, summary: `Recommendation engine failed: ${String(err.message).slice(0, 300)}`,
+          details: { jobId: id, job: 'recommendation-engine' },
+        });
+      } catch (_) {}
     }
   })();
 
@@ -2032,6 +2305,14 @@ if (categoryNames.length === 0) {
     job.logs.push(line);
   }
 
+  const scraperActor = audit.actorFromReq(req);
+  const scraperNote = (e) => getSqlPool().then(p => audit.recordSafe(p, { ...scraperActor, entityType: 'JOB', entityId: id, module: MODULES.SCRAPER, ...e })).catch(() => {});
+  scraperNote({
+    action: ACTIONS.TRIGGER, source: SOURCES.UI,
+    summary: `Started scraper for ${categoryNames.length} categor${categoryNames.length === 1 ? 'y' : 'ies'}: ${categoryNames.join(', ').slice(0, 300)}`,
+    details: { jobId: id, categoryNames },
+  });
+
   jobLog(`🚀 Scraper started by ${startedBy}`);
   console.log(`🚀 Manual scraper triggered by ${startedBy} | job=${id}`);
 
@@ -2077,11 +2358,22 @@ const outcome = await runManualScraper({
         jobLog('✅ Scraper completed successfully.');
         console.log(`✅ Manual scraper done | job=${id}`);
       }
+      scraperNote({
+        action: ACTIONS.FINISH, source: SOURCES.SYSTEM,
+        status: job.status === 'done' ? (job.failedCategories.length ? STATUS.PARTIAL : STATUS.SUCCESS)
+              : job.status === 'cancelled' ? STATUS.PARTIAL : STATUS.FAILED,
+        summary: job.status === 'cancelled' ? 'Scraper was cancelled'
+               : job.status === 'done' ? `Scraper finished: ${job.succeededCategories.length} categor${job.succeededCategories.length === 1 ? 'y' : 'ies'} scraped, ${job.failedCategories.length} with no data`
+               : `Scraper failed: ${String(job.error || '').slice(0, 300)}`,
+        details: { jobId: id, status: job.status, succeeded: job.succeededCategories, failed: job.failedCategories },
+      });
     } catch (err) {
       job.status     = 'error';
       job.error      = err.message;
       job.finishedAt = new Date().toISOString();
       jobLog(`❌ Fatal error: ${err.message}`);
+      scraperNote({ action: ACTIONS.FINISH, source: SOURCES.SYSTEM, status: STATUS.FAILED,
+        summary: `Scraper crashed: ${String(err.message).slice(0, 300)}`, details: { jobId: id } });
       console.error(`❌ Manual scraper failed | job=${id}:`, err.message);
     }
   })();
@@ -2195,8 +2487,6 @@ app.get('/api/scrape-stats/runs', requireRole(['admin', 'supervisor']), async (r
   } catch (err) {
     console.error('❌ /api/scrape-stats/runs error:', err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -2209,8 +2499,6 @@ app.get('/api/scrape-stats/:runId', requireRole(['admin', 'supervisor']), async 
   } catch (err) {
     console.error('❌ /api/scrape-stats/:runId error:', err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -2228,8 +2516,6 @@ app.get('/api/scrape-stats/:runId/sku-matches.csv', requireRole(['admin', 'super
   } catch (err) {
     console.error('❌ /api/scrape-stats/:runId/sku-matches.csv error:', err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -2244,8 +2530,6 @@ app.get('/api/scrape-stats/:runId/sku-matches', requireRole(['admin', 'superviso
   } catch (err) {
     console.error('❌ /api/scrape-stats/:runId/sku-matches error:', err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -2305,8 +2589,6 @@ app.get('/api/category-mappings', requireRole(['admin', 'supervisor']), async (r
   } catch (err) {
     console.error('❌ /api/category-mappings GET error:', err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -2327,9 +2609,20 @@ app.post('/api/category-mappings', requireRole(['admin', 'supervisor']), async (
 
   const mappedBy = req.session?.user?.email || 'unknown';
   let pool;
+  let tx = null;
   try {
     pool = await getSqlPool();
-    const result = await pool.request()
+    tx = new sql.Transaction(pool);
+    await tx.begin();
+
+    const existed = await tx.request()
+      .input('InternalCategory', sql.NVarChar(200), internalCategory)
+      .input('StoreName',        sql.NVarChar(100), storeName)
+      .input('StoreSlug',        sql.NVarChar(200), storeSlug)
+      .query(`SELECT 1 AS x FROM CategoryMappings
+              WHERE StoreName = @StoreName AND StoreSlug = @StoreSlug AND InternalCategory = @InternalCategory`);
+
+    const result = await tx.request()
       .input('InternalCategory', sql.NVarChar(200), internalCategory)
       .input('StoreName',        sql.NVarChar(100), storeName)
       .input('StoreSlug',        sql.NVarChar(200), storeSlug)
@@ -2354,13 +2647,22 @@ app.post('/api/category-mappings', requireRole(['admin', 'supervisor']), async (
           AND InternalCategory = @InternalCategory;
       `);
 
+    if (!existed.recordset.length) { // only a NEW mapping is a change worth auditing
+      await audit.record(tx, {
+        ...audit.actorFromReq(req), module: MODULES.CATEGORY_MAP, action: ACTIONS.CREATE, source: SOURCES.UI,
+        entityType: 'MAPPING', entityId: `${storeName} / ${storeSlug}`, category: internalCategory,
+        summary: `Mapped ${storeName} / ${storeSlug} → ${internalCategory}`,
+        details: { mappingId: result.recordset[0]?.ID, storeName, storeSlug, internalCategory },
+      });
+    }
+    await tx.commit(); tx = null;
+
     console.log(`✅ /api/category-mappings — mapped ${storeName}/${storeSlug} → ${internalCategory} by ${mappedBy}`);
     res.json({ success: true, data: result.recordset[0] });
   } catch (err) {
+    if (tx) { try { await tx.rollback(); } catch (_) {} }
     console.error('❌ /api/category-mappings POST error:', err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -2377,23 +2679,37 @@ app.delete('/api/category-mappings/:id', requireRole(['admin', 'supervisor']), a
   }
 
   let pool;
+  let tx = null;
   try {
     pool = await getSqlPool();
-    const result = await pool.request()
+    tx = new sql.Transaction(pool);
+    await tx.begin();
+
+    const prev = await tx.request().input('ID', sql.Int, id)
+      .query(`SELECT InternalCategory, StoreName, StoreSlug FROM CategoryMappings WHERE ID = @ID`);
+    const result = await tx.request()
       .input('ID', sql.Int, id)
       .query(`DELETE FROM CategoryMappings WHERE ID = @ID`);
 
     if (result.rowsAffected[0] === 0) {
+      await tx.rollback(); tx = null;
       return res.status(404).json({ success: false, error: 'Mapping not found' });
     }
+    const m = prev.recordset[0] || {};
+    await audit.record(tx, {
+      ...audit.actorFromReq(req), module: MODULES.CATEGORY_MAP, action: ACTIONS.DELETE, source: SOURCES.UI,
+      entityType: 'MAPPING', entityId: `${m.StoreName ?? '?'} / ${m.StoreSlug ?? id}`, category: m.InternalCategory,
+      summary: `Removed mapping ${m.StoreName ?? '?'} / ${m.StoreSlug ?? id} → ${m.InternalCategory ?? '?'}`,
+      details: { mappingId: id, ...m },
+    });
+    await tx.commit(); tx = null;
 
     console.log(`✅ /api/category-mappings DELETE — ID=${id}`);
     res.json({ success: true });
   } catch (err) {
+    if (tx) { try { await tx.rollback(); } catch (_) {} }
     console.error(`❌ /api/category-mappings DELETE error:`, err.message);
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
@@ -2434,6 +2750,13 @@ app.post('/api/push-to-shopify', requireAuth, requireWriteAccess, async (req, re
     // Role-based scope: a salesperson can only push prices for their own category/brand
     const scope = await getUserScope(req);
     if (!scope.allows(checkRow.recordset[0].Category, checkRow.recordset[0].Brand)) {
+      await audit.recordSafe(pool, {
+        ...audit.actorFromReq(req), module: MODULES.SELLING_PRICE, action: ACTIONS.PUSH, source: SOURCES.UI,
+        status: STATUS.DENIED, entityType: 'SKU', entityId: skuId,
+        category: checkRow.recordset[0].Category, brand: checkRow.recordset[0].Brand,
+        fieldName: 'SP', newValue: parsedSP,
+        summary: `Blocked: tried to push SP ${parsedSP} for ${skuId} (not assigned to this category/brand)`,
+      });
       return res.status(403).json({ success: false, error: 'You are not assigned to this category/brand' });
     }
     const currentSP = checkRow.recordset[0].SP; // ← NEW: value before this push, for OldSellingPrice
@@ -2508,6 +2831,21 @@ app.post('/api/push-to-shopify', requireAuth, requireWriteAccess, async (req, re
     const result = await request.query(updateQuery);
 
     console.log(`✅ Pushed to Shopify: SKU=${skuId} | SP=₹${parsedSP} (was ₹${currentSP ?? 'N/A'}) | By=${pushedBy} | Manual=${!!isManual}`);
+
+    // Audit (Shopify already changed, so this is recorded after the fact and can't fail the request)
+    await audit.recordSafe(pool, {
+      ...audit.actorFromReq(req), module: MODULES.SELLING_PRICE, action: ACTIONS.PUSH, source: SOURCES.UI,
+      entityType: 'SKU', entityId: skuId,
+      category: checkRow.recordset[0].Category, brand: checkRow.recordset[0].Brand,
+      fieldName: 'SP', oldValue: currentSP, newValue: parsedSP,
+      summary: `Selling price of ${skuId} pushed to Shopify: ${currentSP ?? 'none'} → ${parsedSP}${isManual ? ' (manual price)' : ' (recommended price)'}`,
+      details: {
+        isManual: !!isManual,
+        systemRecommendedSP: systemSP,
+        variancePct: systemSP ? Number((variance * 100).toFixed(2)) : null,
+        varianceConfirmed: !!(requiresConfirm && confirmVariance),
+      },
+    });
     res.json({ success: true, data: result.recordset[0] });
   } catch (err) {
     console.error(`❌ /api/push-to-shopify error for ${skuId}:`, err.message);
@@ -2517,9 +2855,15 @@ app.post('/api/push-to-shopify', requireAuth, requireWriteAccess, async (req, re
         .input('SKU_ID', sql.NVarChar(100), skuId)
         .query(`UPDATE InternalProducts SET ShopifyPushStatus = 'failed' WHERE SKU_ID = @SKU_ID`);
     } catch (_) {}
+    try {
+      const auditPool = await getSqlPool();
+      await audit.recordSafe(auditPool, {
+        ...audit.actorFromReq(req), module: MODULES.SELLING_PRICE, action: ACTIONS.PUSH, source: SOURCES.UI,
+        status: STATUS.FAILED, entityType: 'SKU', entityId: skuId, fieldName: 'SP', newValue: parsedSP,
+        summary: `FAILED to push SP ${parsedSP} for ${skuId}: ${String(err.message).slice(0, 300)}`,
+      });
+    } catch (_) {}
     res.status(500).json({ success: false, error: err.message });
-  } finally {
-    if (pool) await pool.close();
   }
 });
 
