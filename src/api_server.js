@@ -106,6 +106,10 @@ app.use('/api/sync', require('./routes/syncRoutes'));
 app.use('/api/salesperson-mapping', requireRole('admin'),
         require('./routes/salespersonMappingRoutes')(getSqlPool));
 
+// Brand-wise business variables (Settings → Business Variables)
+app.use('/api/business-variables', requireAuth,
+        require('./routes/businessVariablesRoutes')(getSqlPool));
+
 // Admin-only audit log: filterable events + activity feed (read-only)
 app.use('/api/audit', requireRole('admin'),
         require('./routes/auditRoutes')(getSqlPool));
@@ -351,6 +355,7 @@ function findStoreByUrl(productUrl) {
     'theitdepot.com'       : 'theitdepot',
     'computechstore.in'    : 'computechstore',
     'varietyinfotech.com'  : 'varietyinfotech',
+    'ugreenindia.com'      : 'ugreenindia',
     'amazon.in'            : 'amazon',
     'elitehubs.com'        : 'elitehubs',
   };
@@ -656,7 +661,7 @@ app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
       }
 
       const { effectivePP, source } = resolveEffectivePP(product);
-      const { gst, costOfBusiness, profitMargin } = getBusinessVars(categorySettings, product.Category);
+      const { gst, costOfBusiness, profitMargin } = getBusinessVars(categorySettings, product.Category, product.Brand);
       const multiplier     = 1 + gst + costOfBusiness + profitMargin;
       const recommendedSP  = parseFloat((effectivePP * multiplier).toFixed(2));
 
@@ -1075,7 +1080,7 @@ app.get('/api/insights/take-action/:skuId', requireAuth, async (req, res) => {
 
     if (product.PP != null) {
       const categorySettings = await loadCategorySettings(pool);
-      const { gst, costOfBusiness, profitMargin } = getBusinessVars(categorySettings, product.Category);
+      const { gst, costOfBusiness, profitMargin } = getBusinessVars(categorySettings, product.Category, product.Brand);
 
       pricingBreakdown = {
         gstPct: Math.round(gst * 10000) / 100,
@@ -1759,7 +1764,7 @@ app.get('/api/app-settings/:key', requireAuth, async (req, res) => {
 
 
 // ── PUT /api/app-settings/:key ──────────────────────────────────
-app.put('/api/app-settings/:key', requireAuth, requireWriteAccess, async (req, res) => {
+app.put('/api/app-settings/:key', requireAuth, requireRole(['admin', 'supervisor']), async (req, res) => {
   const { value } = req.body;
   if (value == null || value === '') {
     return res.status(400).json({ success: false, error: 'value is required' });
@@ -1838,7 +1843,12 @@ app.get('/api/category-settings', requireAuth, async (req, res) => {
         cs.UpdatedAt, cs.UpdatedBy
       ORDER BY cs.CategoryName
     `);
-    res.json({ success: true, data: result.recordset });
+    // Restricted salespeople only get the categories they are assigned to.
+    const scope = await getUserScope(req);
+    const rows = scope.unrestricted
+      ? result.recordset
+      : result.recordset.filter((r) => scope.allowsCategory(r.CategoryName));
+    res.json({ success: true, data: rows });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -1851,8 +1861,23 @@ app.get('/api/category-settings', requireAuth, async (req, res) => {
 
 
 
+// ── GET /api/internal-categories ──────────────────────────────
+// Category NAMES only (no settings). Used by the Category Mapping tab, which
+// every role may use, so it must not depend on the per-salesperson filtered
+// /api/category-settings response.
+app.get('/api/internal-categories', requireAuth, async (req, res) => {
+  try {
+    const pool = await getSqlPool();
+    const result = await pool.request().query(
+      `SELECT DISTINCT CategoryName FROM CategorySettings WHERE CategoryName IS NOT NULL ORDER BY CategoryName`);
+    res.json({ success: true, data: result.recordset.map((r) => r.CategoryName) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ── PUT /api/category-settings/:category ─────────────────────
-app.put('/api/category-settings/:category', requireAuth, requireWriteAccess, async (req, res) => {
+app.put('/api/category-settings/:category', requireAuth, requireRole(['admin', 'supervisor']), async (req, res) => {
   const categoryName = decodeURIComponent(req.params.category);
   const { GST, CostOfBusiness, ProfitMargin, PPLookbackDays, ScrapFreqDays, IsScrapEnabled } = req.body;
   const updatedBy = req.session?.user?.email || 'unknown';
@@ -2551,7 +2576,7 @@ app.get('/api/health', (req, res) => {
 // ── GET /api/store-categories ─────────────────────────────────
 // Returns all store+slug pairs from urls.js as a flat list.
 // This is the "source" side of the mapping UI.
-app.get('/api/store-categories', requireRole(['admin', 'supervisor']), (req, res) => {
+app.get('/api/store-categories', requireAuth, (req, res) => {
   const flat = [];
   for (const store of STORES) {
     for (const category of store.categories) {
@@ -2576,7 +2601,7 @@ app.get('/api/store-categories', requireRole(['admin', 'supervisor']), (req, res
 
 // ── GET /api/category-mappings ────────────────────────────────
 // Returns all saved mappings from CategoryMappings table.
-app.get('/api/category-mappings', requireRole(['admin', 'supervisor']), async (req, res) => {
+app.get('/api/category-mappings', requireAuth, async (req, res) => {
   let pool;
   try {
     pool = await getSqlPool();
@@ -2597,7 +2622,7 @@ app.get('/api/category-mappings', requireRole(['admin', 'supervisor']), async (r
 // ── POST /api/category-mappings ───────────────────────────────
 // Many-to-many: always INSERTs a new row unless the exact triple
 // (StoreName + StoreSlug + InternalCategory) already exists.
-app.post('/api/category-mappings', requireRole(['admin', 'supervisor']), async (req, res) => {
+app.post('/api/category-mappings', requireAuth, requireWriteAccess, async (req, res) => {
   const { internalCategory, storeName, storeSlug } = req.body;
 
   if (!internalCategory || !storeName || !storeSlug) {
@@ -2672,7 +2697,7 @@ app.post('/api/category-mappings', requireRole(['admin', 'supervisor']), async (
 
 // ── DELETE /api/category-mappings/:id ────────────────────────
 // Removes a mapping by its ID.
-app.delete('/api/category-mappings/:id', requireRole(['admin', 'supervisor']), async (req, res) => {
+app.delete('/api/category-mappings/:id', requireAuth, requireWriteAccess, async (req, res) => {
   const id = parseInt(req.params.id);
   if (isNaN(id)) {
     return res.status(400).json({ success: false, error: 'Invalid ID' });
