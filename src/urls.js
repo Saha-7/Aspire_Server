@@ -216,7 +216,6 @@ const STORES = [
 
 
 
-// // src/urls.js
 {
   name: "computechstore",
   parser: require("./parsers/computechstore"),
@@ -241,7 +240,6 @@ const STORES = [
 },
 
 
-// // src/urls.js
 {
   name: "varietyinfotech",
   parser: require("./parsers/varietyinfotech"),
@@ -257,18 +255,58 @@ const STORES = [
     { slug: 'monitor', url: 'https://varietyinfotech.com/product-category/monitor/'},
     { slug: 'mouse', url: 'https://varietyinfotech.com/product-category/mouse/'},
     { slug: 'keyboards', url: 'https://varietyinfotech.com/product-category/keyboards/'}
-//     //{ slug: '', url: ''},
-//     // { slug: '', url: ''},
-//     // { slug: '', url: ''},
-//     // { slug: '', url: ''},
-//     // { slug: '', url: ''},
-//     //{ slug: '', url: ''},
-//     // { slug: '', url: ''},
-//     // { slug: '', url: ''},
-//     // { slug: '', url: ''},
-//     // { slug: '', url: ''},
    ],
  },
+
+
+
+ {
+  name: "ugreenindia",
+  parser: require("./parsers/ugreenindia"),
+  categories: [
+    { slug: "power-banks",       url: "https://ugreenindia.com/collections/power_banks" },
+    { slug: "switches-splitters-kvm",      url: "https://ugreenindia.com/collections/pc-accessories-switches-splitters" },
+    { slug: "Wall Charger", url:"https://ugreenindia.com/collections/chargers"},
+    { slug: "Wireless & Magsafe chargers", url: "https://ugreenindia.com/collections/magnetic-wireless-chargers"},
+    { slug: "Car Chargers", url: "https://ugreenindia.com/collections/chargers-car-chargers"},
+    { slug: "Travel adapter & Power Accessories", url: "https://ugreenindia.com/collections/travel-power-accessories"},
+
+    { slug: "USB-C Cables", url: "https://ugreenindia.com/collections/cables-usb-type-c"},
+    { slug: "Lightning Cables", url: "https://ugreenindia.com/collections/lightning-cables"},
+    { slug: "USB Cables (Micro, Mini, Printer & Extension)", url: "https://ugreenindia.com/collections/usb-cables"},
+    { slug: "HDMI-cables", url: "https://ugreenindia.com/collections/hdmi-cables"},
+    { slug: "Display-port & Video cables", url: "https://ugreenindia.com/collections/cables-video"},
+    { slug: "Ethernet Cables", url: "https://ugreenindia.com/collections/networking-ethernet-patch-cords"},
+    { slug: "Audio Cables", url: "https://ugreenindia.com/collections/cables-audio"},
+    { slug: "serial & Console Cables", url: "https://ugreenindia.com/collections/serial-cables-convertors"},
+    { slug: "Cable organizer", url: "https://ugreenindia.com/collections/cables-cable-accessories"},
+
+
+    { slug: "Hubs, Docks & Adapters", url: "https://ugreenindia.com/collections/hubs-docks-adapters"},
+
+    { slug: "switches-Extender-Capture",      url: "https://ugreenindia.com/collections/switches-extenders-capture" },
+
+    { slug: "Ethernet Cable, LAN-WiFi Adapters, Network Switch - Tools - Accessories", url: "https://ugreenindia.com/collections/networking-lan-cards"},
+
+    { slug: "SDD-HDD Enclosure", url: "https://ugreenindia.com/collections/pc-accessories-hdd-accessories"},
+    { slug: "Card-Reader", url: "https://ugreenindia.com/collections/pc-accessories-card-readers"},
+    { slug: "Storage Accessories", url: "https://ugreenindia.com/collections/storage-accessories"},
+
+
+    { slug: "Mice-keyboard", url: "https://ugreenindia.com/collections/pc-accessories-mouse"},
+    { slug: "usb-sharing-switches", url: "https://ugreenindia.com/collections/usb-sharing-switches"},
+    { slug: "webcam & Microphones", url: "https://ugreenindia.com/collections/web-camera"},
+
+    {slug: "laptop stands", url: "https://ugreenindia.com/collections/pc-accessories-laptop-tablet-stands"},
+    {slug: "laptop bags", url: "https://ugreenindia.com/collections/laptop-bags-sleeves"},
+
+
+    {slug: "Mobile & Audio", url: "https://ugreenindia.com/collections/mobile-accessories"},
+    {slug: "Car Accessories", url: "https://ugreenindia.com/collections/in-car"},
+  ],
+},
+
+
 
 
  // {
