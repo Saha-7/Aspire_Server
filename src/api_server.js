@@ -2620,9 +2620,11 @@ app.get('/api/category-mappings', requireAuth, async (req, res) => {
 
 
 // ── POST /api/category-mappings ───────────────────────────────
+// Open to every authenticated role (admin, supervisor, sales — assigned or not).
+// Deliberately NOT behind requireWriteAccess and NOT category/brand scoped.
 // Many-to-many: always INSERTs a new row unless the exact triple
 // (StoreName + StoreSlug + InternalCategory) already exists.
-app.post('/api/category-mappings', requireAuth, requireWriteAccess, async (req, res) => {
+app.post('/api/category-mappings', requireAuth, async (req, res) => {
   const { internalCategory, storeName, storeSlug } = req.body;
 
   if (!internalCategory || !storeName || !storeSlug) {
@@ -2697,7 +2699,7 @@ app.post('/api/category-mappings', requireAuth, requireWriteAccess, async (req, 
 
 // ── DELETE /api/category-mappings/:id ────────────────────────
 // Removes a mapping by its ID.
-app.delete('/api/category-mappings/:id', requireAuth, requireWriteAccess, async (req, res) => {
+app.delete('/api/category-mappings/:id', requireAuth, async (req, res) => {
   const id = parseInt(req.params.id);
   if (isNaN(id)) {
     return res.status(400).json({ success: false, error: 'Invalid ID' });
