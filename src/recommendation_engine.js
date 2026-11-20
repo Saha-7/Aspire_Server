@@ -100,6 +100,59 @@ async function loadAllInternalProducts(pool) {
   return result.recordset;
 }
 
+// ── Step 1c: Basic Recommendations product list ──────────────────────
+// Basic Recommendations shows ONLY active AND in-stock products. PP is NOT
+// required — products with no PP are still listed so the user can set the PP
+// straight from the row. (Competitor Based keeps loadInternalProducts().)
+async function loadActiveInStockInternalProducts(pool) {
+  console.log('📦 Loading ACTIVE + IN-STOCK internal products (Basic Recommendations)...');
+
+  const result = await pool.request().query(`
+    SELECT
+      SKU_ID,
+      Title,
+      PP,
+      SP,
+      Category,
+      Brand,
+      isActive,
+      isInStock,
+      LastBillDate,
+      ManualPP_UpdatedAt,
+      ManualPP_UpdatedBy
+    FROM InternalProducts
+    WHERE isActive  = 1
+      AND isInStock = 1
+  `);
+
+  console.log(`   ✅ ${result.recordset.length} active + in-stock internal products`);
+  return result.recordset;
+}
+
+// ── Step 1d: ONE internal product by SKU ─────────────────────────────
+// Used to recalculate a single row right after its PP is edited.
+async function loadInternalProductBySku(pool, skuId) {
+  const result = await pool.request()
+    .input('SKU_ID', sql.NVarChar(100), skuId)
+    .query(`
+      SELECT
+        SKU_ID,
+        Title,
+        PP,
+        SP,
+        Category,
+        Brand,
+        isActive,
+        isInStock,
+        LastBillDate,
+        ManualPP_UpdatedAt,
+        ManualPP_UpdatedBy
+      FROM InternalProducts
+      WHERE SKU_ID = @SKU_ID
+    `);
+  return result.recordset[0] || null;
+}
+
 // ── Determine effective PP for a product ─────────────────────────────
 function resolveEffectivePP(product) {
   const { PP, LastBillDate, ManualPP_UpdatedAt } = product;
@@ -322,6 +375,8 @@ module.exports = {
   loadCategorySettings,
   loadInternalProducts,
   loadAllInternalProducts,
+  loadActiveInStockInternalProducts,
+  loadInternalProductBySku,
   loadCompetitorPrices,
   buildCompetitorMap,
   generateRecommendations,
@@ -720,6 +775,3 @@ module.exports = {
 //   getBusinessVars,
 //   calculateRecommendedPrice
 // };
-
-
-
