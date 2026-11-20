@@ -147,6 +147,19 @@ tracked separately from the matching logic documented here.
 ```
 
 
+---
+
+## Azure Functions (tpsazurefx-node)
+
+| Function | Schedule (cron, UTC) | What it does |
+|---|---|---|
+| `internal-db-sync-trigger` | `0 30 6 * * *` (daily) | Runs `syncInternalProducts`. Reads `vw_Shopify_Product_SKUs` and the Zoho bills view, joins them, and MERGEs into `InternalProducts`. Inserts new products and updates SP, PP, brand, category, active and stock flags. |
+| `sp-only-sync-trigger` | `0 */10 * * * *` (every 10 min) | Runs `syncSPOnly`. Light job that only updates SP, `isActive` and `isInStock` on existing `InternalProducts` rows. Never inserts and never touches PP. |
+| `scheduler-trigger` | `0 0 2 * * *` (daily) | Runs the competitor price scraper (Bright Data) via runScheduler. |
+
+Before deploying, run `azure-functions/sync-src.ps1` to copy the latest sync files from `src/` into `azure-functions/`.
+
+---
 
 
 
