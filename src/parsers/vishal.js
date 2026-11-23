@@ -264,24 +264,47 @@ const originalPrice =
   | bodyText check that also covers "unavailable".
   */
 
-  let availabilityText = null;
+  // The page ALWAYS contains both of these, and the theme hides one with the
+  // class "d-none" (or an inline display:none):
+  //   <span id="js-pr-available">In Stock</span>
+  //   <span id="js-pr-unavailable">Unavailable</span>
+  // The old code read the first <span> after the "Availability:" label, which
+  // is always the (possibly hidden) "In Stock" one. So: read which is VISIBLE.
+  const isHidden = (el) =>
+    el.hasClass('d-none') || /display\s*:\s*none/i.test(el.attr('style') || '');
 
-  $('label').each((_, el) => {
-    const labelText = cleanText($(el).text());
+  const availEl   = $('#js-pr-available').first();
+  const unavailEl = $('#js-pr-unavailable').first();
+  const availVisible   = availEl.length   > 0 && !isHidden(availEl);
+  const unavailVisible = unavailEl.length > 0 && !isHidden(unavailEl);
 
-    if (
-      labelText &&
-      labelText.toLowerCase().includes('availability')
-    ) {
-      availabilityText = cleanText($(el).next('span').text());
-    }
-  });
+  let stockStatus;
 
-  const stockStatus = /unavailable|out of stock|sold out/i.test(
-    availabilityText || bodyText
-  )
-    ? 'Out of Stock'
-    : 'In Stock';
+  if (unavailVisible && !availVisible) {
+    stockStatus = 'Out of Stock';
+  } else if (availVisible && !unavailVisible) {
+    stockStatus = 'In Stock';
+  } else {
+    // Ambiguous or markup changed — fall back to the previous text check.
+    let availabilityText = null;
+
+    $('label').each((_, el) => {
+      const labelText = cleanText($(el).text());
+
+      if (
+        labelText &&
+        labelText.toLowerCase().includes('availability')
+      ) {
+        availabilityText = cleanText($(el).next('span').text());
+      }
+    });
+
+    stockStatus = /unavailable|out of stock|sold out/i.test(
+      availabilityText || bodyText
+    )
+      ? 'Out of Stock'
+      : 'In Stock';
+  }
 
   /*
   |--------------------------------------------------------------------------
