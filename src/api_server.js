@@ -44,6 +44,8 @@ const {
 const { scrapeProduct }    = require('./scraper/scrapeProduct');
 const { upsertOneProduct } = require('./services/competitorPriceService');
 const { STORES }           = require('./urls');
+const { computeRecommendedSP } = require('./services/pricing');
+const { getGlobalScrapeLimiter } = require('./scraper/concurrency');
 const { runScheduler,runManualScraper, getManualScraperCategories, }     = require('./scheduler/index'); // ← ADDED
 
 const session        = require('express-session');
@@ -370,51 +372,19 @@ function findStoreByUrl(productUrl) {
 }
 
 // ── Helper: recalculate RecommendedSP for one SKU ────────────
+// Uses the SAME business variables (brand → category → default) and the SAME
+// shared pricing function as the Basic list, so a row refresh can never
+// disagree with the table. (This used to hardcode 18/7/5.)
 async function recalculateRecommendedSP(pool, skuId) {
-  const GST               = 0.18;
-  const COST_OF_BUSINESS  = 0.07;
-  const MIN_PROFIT_MARGIN = 0.05;
+  const product = await loadInternalProductBySku(pool, skuId);
+  if (!product || product.PP == null) return null;
 
-  const productResult = await pool.request()
-    .input('SKU_ID', sql.NVarChar(100), skuId)
-    .query(`SELECT PP FROM InternalProducts WHERE SKU_ID = @SKU_ID AND PP IS NOT NULL`);
+  const categorySettings = await loadCategorySettings(pool);
+  const summaryMap       = await loadCompetitorSummaryMap(pool, skuId);
+  const row = buildBasicRecommendationRow(product, categorySettings, summaryMap.get(normSku(skuId)));
 
-  if (!productResult.recordset.length) return null;
-
-  const pp = parseFloat(productResult.recordset[0].PP);
-
-  const competitorResult = await pool.request()
-    .input('SKU', sql.NVarChar(100), skuId)
-    .query(`
-      SELECT TOP 1 CompetitorPrice
-      FROM CompetitorPrices
-      WHERE SKU = @SKU
-        AND CompetitorPrice IS NOT NULL
-        AND LOWER(StockStatus) != 'out of stock'
-      ORDER BY CompetitorPrice ASC
-    `);
-
-  if (!competitorResult.recordset.length) return null;
-
-  const lowestCompetitorPrice = parseFloat(competitorResult.recordset[0].CompetitorPrice);
-  const basePrice = parseFloat((pp * (1 + GST + COST_OF_BUSINESS + MIN_PROFIT_MARGIN)).toFixed(2));
-
-  let recommendedSP = basePrice;
-  if (lowestCompetitorPrice > basePrice) {
-    const target = parseFloat((lowestCompetitorPrice * 0.99).toFixed(2));
-    if (target > basePrice) recommendedSP = target;
-  }
-
-  await pool.request()
-    .input('SKU_ID',        sql.NVarChar(100),  skuId)
-    .input('RecommendedSP', sql.Decimal(10, 2), recommendedSP)
-    .query(`
-      UPDATE InternalProducts
-      SET RecommendedSP = @RecommendedSP, RecommendedSPUpdatedAt = GETDATE()
-      WHERE SKU_ID = @SKU_ID
-    `);
-
-  return recommendedSP;
+  await persistRecommendedSP(pool, [row]);
+  return row.RecommendedSP;
 }
 
 
@@ -603,10 +573,63 @@ app.get('/api/recommendations', requireAuth, async (req, res) => {
 
 
 
+const normSku = (v) => String(v || '').trim().toUpperCase();
+
+// ── Competitor summary per SKU (for the Basic table) ─────────────────
+// "Matched" = the SKU has at least one row in CompetitorPrices (SKU match
+// only — no other condition). One query for all SKUs, or for one SKU.
+// Returns Map(normalisedSKU → { storeCount, lowestPrice, storeName, stockStatus })
+// lowestPrice / storeName / stockStatus describe the lowest IN-STOCK
+// competitor; they are null when the SKU is matched but every store is
+// out of stock (the row is still "matched").
+async function loadCompetitorSummaryMap(pool, skuId = null) {
+  const request = pool.request();
+  let where = '';
+  if (skuId) {
+    request.input('SKU', sql.NVarChar(100), skuId);
+    where = 'WHERE SKU = @SKU';
+  }
+  const result = await request.query(`
+    WITH ranked AS (
+      SELECT SKU, CompetitorPrice, StoreName, StockStatus,
+        COUNT(*) OVER (PARTITION BY SKU) AS StoreCount,
+        ROW_NUMBER() OVER (
+          PARTITION BY SKU
+          ORDER BY
+            CASE WHEN CompetitorPrice IS NOT NULL
+                  AND StockStatus IS NOT NULL
+                  AND LOWER(StockStatus) <> 'out of stock' THEN 0 ELSE 1 END,
+            CompetitorPrice ASC
+        ) AS rn
+      FROM CompetitorPrices
+      ${where}
+    )
+    SELECT SKU, CompetitorPrice, StoreName, StockStatus, StoreCount
+    FROM ranked
+    WHERE rn = 1
+  `);
+
+  const map = new Map();
+  for (const r of result.recordset) {
+    const inStock = r.CompetitorPrice != null
+      && r.StockStatus != null
+      && String(r.StockStatus).toLowerCase().trim() !== 'out of stock';
+    map.set(normSku(r.SKU), {
+      storeCount : Number(r.StoreCount) || 0,
+      lowestPrice: inStock ? parseFloat(r.CompetitorPrice) : null,
+      storeName  : inStock ? r.StoreName : null,
+      stockStatus: inStock ? r.StockStatus : null,
+    });
+  }
+  return map;
+}
+
 // ── Build ONE Basic Recommendations row ───────────────────────
-// Shared by the list endpoint and the single-row recalculation endpoint so
-// both always produce exactly the same shape and the same math.
-function buildBasicRecommendationRow(product, categorySettings) {
+// Shared by the list endpoint, the single-row endpoint, the row Refresh and
+// recalculateRecommendedSP so every path produces the same shape and math.
+// `competitor` is optional (from loadCompetitorSummaryMap): matched SKUs
+// get the competitor-aware recommendation, unmatched ones the plain floor.
+function buildBasicRecommendationRow(product, categorySettings, competitor = null) {
   const base = {
     SKU_ID   : product.SKU_ID,
     Title    : product.Title,
@@ -615,77 +638,79 @@ function buildBasicRecommendationRow(product, categorySettings) {
     isActive : product.isActive,
     isInStock: product.isInStock,
     SP       : product.SP != null ? parseFloat(product.SP) : null,
+    // Competitor info (display only — empty when the SKU is not matched)
+    HasCompetitor        : !!competitor,
+    CompetitorCount      : competitor ? competitor.storeCount : 0,
+    CompetitorPrice      : competitor ? competitor.lowestPrice : null,
+    StoreName            : competitor ? competitor.storeName : null,
+    CompetitorStockStatus: competitor ? competitor.stockStatus : null,
   };
 
   // No PP yet (bill not received / never set) — can't compute a
-  // RecommendedSP. Still show the row so the user can set the PP from it.
+  // RecommendedSP. Still show the row (and its competitor prices) so the
+  // user can set the PP from it.
   if (product.PP == null) {
     return {
       ...base,
-      PP           : null,
-      PPSource     : null,
-      RecommendedSP: null,
-      GSTPct       : null,
-      COBPct       : null,
-      MarginPct    : null,
+      PP             : null,
+      PPSource       : null,
+      RecommendedSP  : null,
+      BaseFloor      : null,
+      PricingStrategy: null,
+      ExtraProfitPct : null,
+      GSTPct         : null,
+      COBPct         : null,
+      MarginPct      : null,
     };
   }
 
   const { effectivePP, source } = resolveEffectivePP(product);
-  const { gst, costOfBusiness, profitMargin } = getBusinessVars(categorySettings, product.Category, product.Brand);
-  const multiplier    = 1 + gst + costOfBusiness + profitMargin;
-  // Round to 2 decimals first (kills floating-point noise like 1000.0000001),
-  // then take the CEILING so the recommended SP is always a whole rupee
-  // (327.01 → 328, 327.50 → 328, 328.00 stays 328).
-  const recommendedSP = Math.ceil(parseFloat((effectivePP * multiplier).toFixed(2)));
+  const vars = getBusinessVars(categorySettings, product.Category, product.Brand);
+  const { gst, costOfBusiness, profitMargin } = vars;
+
+  const { recommendedSP, baseFloor, pricingStrategy } = computeRecommendedSP({
+    pp: effectivePP,
+    vars: { gst, costOfBusiness, profitMargin },
+    lowestCompetitorPrice: competitor ? competitor.lowestPrice : null,
+  });
 
   return {
     ...base,
-    PP           : effectivePP,
-    PPSource     : source,
-    RecommendedSP: recommendedSP,
-    GSTPct       : parseFloat((gst * 100).toFixed(2)),
-    COBPct       : parseFloat((costOfBusiness * 100).toFixed(2)),
-    MarginPct    : parseFloat((profitMargin * 100).toFixed(2)),
+    PP             : effectivePP,
+    PPSource       : source,
+    RecommendedSP  : recommendedSP,
+    BaseFloor      : baseFloor,
+    PricingStrategy: pricingStrategy,
+    ExtraProfitPct : baseFloor > 0
+      ? parseFloat((((recommendedSP - baseFloor) / baseFloor) * 100).toFixed(2))
+      : null,
+    GSTPct         : parseFloat((gst * 100).toFixed(2)),
+    COBPct         : parseFloat((costOfBusiness * 100).toFixed(2)),
+    MarginPct      : parseFloat((profitMargin * 100).toFixed(2)),
   };
 }
 
 // ── GET /api/internal-recommendations ─────────────────────────
-// Internal-data-only RecommendedSP — no competitor matching at all.
-// Shows ONLY products that are ACTIVE and IN STOCK (PP may or may not be
-// set — rows without PP are listed so the PP can be set from the row),
-// MINUS any SKU that's eligible for the Competitor Based table (that table
-// has priority — a SKU should never appear in both).
-// Computed live on every request, and persisted to SQL so the
-// variance check on push has a real value to compare against.
+// Basic Recommendations: ACTIVE + IN-STOCK products (PP may or may not be
+// set — rows without PP are listed so the PP can be set from the row).
+// Every row also carries its competitor summary when the SKU is matched with
+// any competitor (SKU match only). Matched rows get the competitor-aware
+// Recommended SP (1% below the lowest in-stock competitor, never below the
+// floor); unmatched rows get the plain floor.
+// Computed live on every request, and persisted to SQL so the variance
+// check on push has a real value to compare against.
 app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
   let pool;
   try {
     pool = await getSqlPool();
 
     const categorySettings = await loadCategorySettings(pool);
-    // Only active + in-stock products. loadInternalProducts() (PP/active/in-stock
-    // filtered) stays reserved for the Competitor Based engine.
     const internalProducts = await loadActiveInStockInternalProducts(pool);
+    const competitorMap    = await loadCompetitorSummaryMap(pool);
 
-    // Fetch the set of SKUs that qualify for Competitor Based Recommendation —
-    // same match condition used in /api/recommendations (valid competitor price,
-    // competitor not out of stock). Basic Recommendations must exclude these.
-    const competitorMatchResult = await pool.request().query(`
-      SELECT DISTINCT SKU
-      FROM CompetitorPrices
-      WHERE CompetitorPrice IS NOT NULL
-        AND LOWER(StockStatus) != 'out of stock'
-    `);
-    const competitorMatchedSkus = new Set(
-      competitorMatchResult.recordset.map(r => (r.SKU || '').trim().toUpperCase())
+    const rows = internalProducts.map(product =>
+      buildBasicRecommendationRow(product, categorySettings, competitorMap.get(normSku(product.SKU_ID)))
     );
-
-    const eligibleProducts = internalProducts.filter(
-      product => !competitorMatchedSkus.has((product.SKU_ID || '').trim().toUpperCase())
-    );
-
-    const rows = eligibleProducts.map(product => buildBasicRecommendationRow(product, categorySettings));
 
     // Persist so the variance check on push has a real value to compare against.
     try {
@@ -696,7 +721,8 @@ app.get('/api/internal-recommendations', requireAuth, async (req, res) => {
 
     const scope = await getUserScope(req);
     const visibleRows = scope.filterRows(rows);
-    console.log(`✅ /api/internal-recommendations — ${visibleRows.length} rows served (${rows.length} active + in-stock products, excluded ${competitorMatchedSkus.size} competitor-matched SKUs)`);
+    const matchedCount = rows.filter(r => r.HasCompetitor).length;
+    console.log(`✅ /api/internal-recommendations — ${visibleRows.length} rows served (${rows.length} active + in-stock products, ${matchedCount} competitor-matched)`);
     res.json({ success: true, data: visibleRows });
   } catch (err) {
     console.error('❌ /api/internal-recommendations error:', err.message);
@@ -729,7 +755,8 @@ app.get('/api/internal-recommendations/:sku', requireAuth, async (req, res) => {
     }
 
     const categorySettings = await loadCategorySettings(pool);
-    const row = buildBasicRecommendationRow(product, categorySettings);
+    const competitorMap    = await loadCompetitorSummaryMap(pool, skuId);
+    const row = buildBasicRecommendationRow(product, categorySettings, competitorMap.get(normSku(skuId)));
 
     try {
       await persistRecommendedSP(pool, [row]);
@@ -834,6 +861,104 @@ app.post('/api/refresh-product', requireAuth, requireWriteAccess, async (req, re
 });
 
 
+// ── POST /api/refresh-sku-competitors ─────────────────────────
+// Basic table row Refresh: re-scrapes EVERY stored competitor URL for one
+// SKU (only SKUs that are already matched have URLs), upserts them, and
+// returns the freshly recalculated Basic row. Scrapes go through the shared
+// process-wide limiter so they can never exceed SCRAPE_CONCURRENCY together
+// with any running category scrape.
+app.post('/api/refresh-sku-competitors', requireAuth, requireWriteAccess, async (req, res) => {
+  const skuId = String(req.body?.skuId || '').trim();
+  if (!skuId) {
+    return res.status(400).json({ success: false, error: 'skuId is required' });
+  }
+  console.log(`\n🔄 Refresh all competitors: SKU=${skuId}`);
+
+  try {
+    const pool = await getSqlPool();
+
+    const scope = await getUserScope(req);
+    if (!scope.unrestricted) {
+      const { denied } = await partitionSkus(pool, scope, [skuId]);
+      if (denied.length) {
+        return res.status(403).json({ success: false, error: 'You are not assigned to this category/brand' });
+      }
+    }
+
+    const urlRows = await pool.request()
+      .input('SKU', sql.NVarChar(100), skuId)
+      .query(`SELECT StoreName, ProductURL FROM CompetitorPrices WHERE SKU = @SKU AND ProductURL IS NOT NULL`);
+
+    if (!urlRows.recordset.length) {
+      return res.status(404).json({ success: false, error: 'No competitor URLs stored for this SKU' });
+    }
+
+    const limit = getGlobalScrapeLimiter(parseInt(process.env.SCRAPE_CONCURRENCY || '5', 10));
+
+    const results = await Promise.all(urlRows.recordset.map(r => limit(async () => {
+      const store = findStoreByUrl(r.ProductURL);
+      if (!store) return { store: r.StoreName, ok: false, error: 'Unknown store URL' };
+      try {
+        const product = await scrapeProduct(store, r.ProductURL);
+        if (!product || !product.name) return { store: store.name, ok: false, error: 'No product data found' };
+        const upserted = await upsertOneProduct(product);
+        if (!upserted) return { store: store.name, ok: false, error: 'SKU could not be mapped' };
+        return { store: store.name, ok: true, price: upserted.CompetitorPrice ?? null };
+      } catch (e) {
+        return { store: store.name, ok: false, error: e.message };
+      }
+    })));
+
+    const okCount = results.filter(r => r.ok).length;
+    if (okCount === 0) {
+      return res.status(422).json({ success: false, error: 'Could not refresh any store', results });
+    }
+
+    // Fresh row (competitor summary + recommended SP) after the upserts
+    const product = await loadInternalProductBySku(pool, skuId);
+    if (!product) {
+      return res.status(404).json({ success: false, error: `SKU not found: ${skuId}` });
+    }
+    const categorySettings = await loadCategorySettings(pool);
+    const competitorMap    = await loadCompetitorSummaryMap(pool, skuId);
+    const row = buildBasicRecommendationRow(product, categorySettings, competitorMap.get(normSku(skuId)));
+    try {
+      await persistRecommendedSP(pool, [row]);
+    } catch (persistErr) {
+      console.error('⚠️ Failed to persist RecommendedSP (non-fatal):', persistErr.message);
+    }
+
+    const refreshedBy = req.session?.user?.email || req.headers['x-user-email'] || 'manual';
+    const refreshedAt = new Date().toISOString();
+    await pool.request()
+      .input('SKU_ID',              sql.NVarChar(100), skuId)
+      .input('LastManualRefreshAt', sql.NVarChar(50),  refreshedAt)
+      .input('LastManualRefreshBy', sql.NVarChar(100), refreshedBy)
+      .query(`
+        UPDATE InternalProducts
+        SET LastManualRefreshAt = @LastManualRefreshAt,
+            LastManualRefreshBy = @LastManualRefreshBy
+        WHERE SKU_ID = @SKU_ID
+      `);
+
+    await audit.recordSafe(pool, {
+      ...audit.actorFromReq(req), module: MODULES.SCRAPER, action: ACTIONS.REFRESH, source: SOURCES.UI,
+      entityType: 'SKU', entityId: skuId, fieldName: 'RecommendedSP', newValue: row.RecommendedSP,
+      summary: `Manual refresh of ${skuId} from ${okCount}/${results.length} competitor stores: recommended SP ${row.RecommendedSP ?? 'n/a'}`,
+      details: { results },
+    });
+
+    res.json({
+      success: true, skuId, row, results, refreshedAt, refreshedBy,
+      message: `${okCount} of ${results.length} stores updated`,
+    });
+  } catch (err) {
+    console.error(`❌ Refresh all competitors failed: ${err.message}`);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
 // ── GET /api/competitor-details/:skuId ───────────────────────
 app.get('/api/competitor-details/:skuId', requireAuth, async (req, res) => {
   const { skuId } = req.params;
@@ -847,15 +972,30 @@ app.get('/api/competitor-details/:skuId', requireAuth, async (req, res) => {
     if (denied.length) {
       return res.status(403).json({ success: false, error: 'You are not assigned to this category/brand' });
     }
-    const result = await pool.request()
-      .input('SKU', sql.NVarChar(100), skuId)
-      .query(`
-        SELECT TOP 4 CompetitorPrice, ProductURL, StoreName, StockStatus
+    // ?all=1 (Basic table): every matched store, in-stock first (cheapest
+    // first), out-of-stock last, no 4-row cap. Default (Intelligence table):
+    // unchanged — top 4 cheapest in-stock stores.
+    const showAll = req.query.all === '1' || req.query.all === 'true';
+    const query = showAll
+      ? `
+        SELECT CompetitorPrice, ProductURL, StoreName, StockStatus, ScrapedAt
+        FROM CompetitorPrices
+        WHERE SKU = @SKU
+        ORDER BY
+          CASE WHEN CompetitorPrice IS NOT NULL AND StockStatus IS NOT NULL
+                AND LOWER(StockStatus) <> 'out of stock' THEN 0 ELSE 1 END,
+          CompetitorPrice ASC
+      `
+      : `
+        SELECT TOP 4 CompetitorPrice, ProductURL, StoreName, StockStatus, ScrapedAt
         FROM CompetitorPrices
         WHERE SKU = @SKU AND CompetitorPrice IS NOT NULL
           AND LOWER(StockStatus) != 'out of stock'
         ORDER BY CompetitorPrice ASC
-      `);
+      `;
+    const result = await pool.request()
+      .input('SKU', sql.NVarChar(100), skuId)
+      .query(query);
     res.json({ success: true, data: result.recordset });
   } catch (err) {
     console.error(`❌ /api/competitor-details/${skuId}:`, err.message);

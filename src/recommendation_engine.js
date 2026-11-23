@@ -18,6 +18,7 @@ const {
   loadBusinessVariables,
   getBusinessVars,
 } = require('./services/businessVariablesService');
+const { computeRecommendedSP } = require('./services/pricing');
 
 function isInStock(stockStatus) {
   if (!stockStatus) return false;
@@ -201,19 +202,14 @@ function buildCompetitorMap(competitorRows) {
 
 // ── Step 4: Calculate recommended price ──────────────────────────────
 function calculateRecommendedPrice(pp, lowestCompetitorPrice, gst, costOfBusiness, profitMargin) {
-  const multiplier = 1 + gst + costOfBusiness + profitMargin;
-  const basePrice  = parseFloat((pp * multiplier).toFixed(2));
-
-  if (lowestCompetitorPrice <= basePrice) {
-    return { recommendedSP: basePrice, pricingStrategy: 'floor' };
-  }
-
-  const target = parseFloat((lowestCompetitorPrice * 0.99).toFixed(2));
-  if (target > basePrice) {
-    return { recommendedSP: target, pricingStrategy: 'optimized' };
-  }
-
-  return { recommendedSP: basePrice, pricingStrategy: 'floor' };
+  // Delegates to the shared pricing function so Basic, Intelligence and the
+  // row Refresh always use exactly the same math.
+  const { recommendedSP, pricingStrategy } = computeRecommendedSP({
+    pp,
+    vars: { gst, costOfBusiness, profitMargin },
+    lowestCompetitorPrice,
+  });
+  return { recommendedSP, pricingStrategy };
 }
 
 // ── Step 5: Generate recommendations ─────────────────────────────────
