@@ -18,7 +18,7 @@ const {
   loadBusinessVariables,
   getBusinessVars,
 } = require('./services/businessVariablesService');
-const { computeRecommendedSP } = require('./services/pricing');
+const { computeRecommendedSP, getProductWeightKg } = require('./services/pricing');
 
 function isInStock(stockStatus) {
   if (!stockStatus) return false;
@@ -201,13 +201,16 @@ function buildCompetitorMap(competitorRows) {
 }
 
 // ── Step 4: Calculate recommended price ──────────────────────────────
-function calculateRecommendedPrice(pp, lowestCompetitorPrice, gst, costOfBusiness, profitMargin) {
+// `globals` = global costs (Shopify fee, gateway, packing, shipping rates) from
+// getBusinessVars(...).globals; `weightKg` = product weight or null.
+function calculateRecommendedPrice(pp, lowestCompetitorPrice, gst, costOfBusiness, profitMargin, globals = null, weightKg = null) {
   // Delegates to the shared pricing function so Basic, Intelligence and the
   // row Refresh always use exactly the same math.
   const { recommendedSP, pricingStrategy } = computeRecommendedSP({
     pp,
-    vars: { gst, costOfBusiness, profitMargin },
+    vars: { gst, costOfBusiness, profitMargin, globals },
     lowestCompetitorPrice,
+    weightKg,
   });
   return { recommendedSP, pricingStrategy };
 }
@@ -233,18 +236,23 @@ function generateRecommendations(internalProducts, competitorMap, categorySettin
     if (source === 'manual') sourceManual++;
     else                     sourceBill++;
 
-    const { gst, costOfBusiness, profitMargin } = getBusinessVars(categorySettings, product.Category, product.Brand);
+    const vars = getBusinessVars(categorySettings, product.Category, product.Brand);
+    const { gst, costOfBusiness, profitMargin } = vars;
     const multiplier = 1 + gst + costOfBusiness + profitMargin;
 
     if (!categoryVarLog.has(product.Category)) {
       categoryVarLog.set(product.Category, { gst, costOfBusiness, profitMargin, multiplier });
     }
 
-    const { recommendedSP, pricingStrategy } = calculateRecommendedPrice(
-      effectivePP, lowestEntry.price, gst, costOfBusiness, profitMargin
-    );
+    // Same shared formula as the Basic table: includes the global costs
+    // (Shopify fee, gateway, packing, and shipping once weight data exists).
+    const { recommendedSP, baseFloor, pricingStrategy } = computeRecommendedSP({
+      pp: effectivePP,
+      vars,
+      lowestCompetitorPrice: lowestEntry.price,
+      weightKg: getProductWeightKg(product),
+    });
 
-    const baseFloor   = parseFloat((effectivePP * multiplier).toFixed(2));
     const extraProfit = parseFloat((recommendedSP - baseFloor).toFixed(2));
 
     if (pricingStrategy === 'floor')     strategyFloor++;

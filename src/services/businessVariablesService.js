@@ -13,6 +13,7 @@
 'use strict';
 
 const sql = require('mssql');
+const { DEFAULT_GLOBALS } = require('./pricing');
 
 // Which DB variable feeds which property of the pricing formula.
 // A brand-new variable that should change the PRICE needs a line here AND a
@@ -29,6 +30,47 @@ const FALLBACK_DEFS = [
   { key: 'COST_OF_BUSINESS', label: 'Cost of Business', default: 7,  min: 0, max: 100, sortOrder: 20 },
   { key: 'PROFIT_MARGIN',    label: 'Profit Margin',    default: 5,  min: 0, max: 100, sortOrder: 30 },
 ];
+
+// ── Global pricing costs (same for every product) ────────────────────────
+// Stored in dbo.AppSettings (SettingKey -> property used by pricing.js).
+// Percent keys hold whole percents (1 = 1%), money keys hold rupees.
+// To add a new global cost: add the AppSettings row, add it here, add it to
+// DEFAULT_GLOBALS in pricing.js, and use it in computeFloor().
+const GLOBAL_SETTING_KEYS = {
+  SHOPIFY_FEE_PCT     : 'shopifyFeePct',
+  PAYMENT_GATEWAY_PCT : 'paymentGatewayPct',
+  PACKING_COST        : 'packingCost',
+  SHIPPING_RATE_PER_KG: 'shippingRatePerKg',
+  SHIPPING_MIN_COST   : 'shippingMinCost',
+};
+
+// Reads the global costs; any missing / invalid / negative value falls back to
+// the default so a bad row can never break price calculation.
+async function loadPricingGlobals(pool) {
+  const globals = { ...DEFAULT_GLOBALS };
+  try {
+    const keys = Object.keys(GLOBAL_SETTING_KEYS);
+    const req = pool.request();
+    keys.forEach((k, i) => req.input(`k${i}`, sql.NVarChar(100), k));
+    const r = await req.query(
+      `SELECT SettingKey, SettingValue FROM dbo.AppSettings
+       WHERE SettingKey IN (${keys.map((_, i) => `@k${i}`).join(', ')})`);
+    for (const row of r.recordset) {
+      const prop = GLOBAL_SETTING_KEYS[row.SettingKey];
+      const num  = parseFloat(row.SettingValue);
+      if (prop && Number.isFinite(num) && num >= 0) globals[prop] = num;
+      else console.warn(`⚠️  AppSettings ${row.SettingKey} = "${row.SettingValue}" is invalid, using default`);
+    }
+  } catch (err) {
+    console.error('⚠️  Global pricing costs unreadable, using defaults:', err.message);
+  }
+  if (globals.shopifyFeePct + globals.paymentGatewayPct >= 100) {
+    console.error('⚠️  Shopify fee + gateway % must be below 100 — using default fee percentages');
+    globals.shopifyFeePct     = DEFAULT_GLOBALS.shopifyFeePct;
+    globals.paymentGatewayPct = DEFAULT_GLOBALS.paymentGatewayPct;
+  }
+  return globals;
+}
 
 const SEP = '\u0001';
 // SQL Server's default collation is case-insensitive, so "HP" and "Hp" are the
@@ -69,7 +111,9 @@ async function loadBusinessVariables(pool) {
     values.get(k).set(row.VarKey, Number(row.Value));
   }
 
-  return { defs, defsByKey: new Map(defs.map((d) => [d.key, d])), values };
+  const globals = await loadPricingGlobals(pool);
+
+  return { defs, defsByKey: new Map(defs.map((d) => [d.key, d])), values, globals };
 }
 
 // ── Effective variables for one product ──────────────────────────────────
@@ -94,6 +138,7 @@ function getBusinessVars(bv, category, brand) {
     }
   }
   out.all = all;
+  out.globals = bv.globals || { ...DEFAULT_GLOBALS };   // global costs (Shopify fee, gateway, packing, shipping)
   return out;
 }
 
@@ -231,6 +276,6 @@ async function saveVariables(tx, { category, brand, changes, updatedBy, defsByKe
 }
 
 module.exports = {
-  loadBusinessVariables, getBusinessVars, getSettingsTree, saveVariables,
+  loadBusinessVariables, loadPricingGlobals, getBusinessVars, getSettingsTree, saveVariables,
   ConflictError, KEY_TO_PROP, norm,
 };

@@ -44,7 +44,7 @@ const {
 const { scrapeProduct }    = require('./scraper/scrapeProduct');
 const { upsertOneProduct } = require('./services/competitorPriceService');
 const { STORES }           = require('./urls');
-const { computeRecommendedSP } = require('./services/pricing');
+const { computeRecommendedSP, computeFloor, getProductWeightKg } = require('./services/pricing');
 const { getGlobalScrapeLimiter } = require('./scraper/concurrency');
 const { runScheduler,runManualScraper, getManualScraperCategories, }     = require('./scheduler/index'); // ← ADDED
 
@@ -453,10 +453,6 @@ app.get('/api/recommendations', requireAuth, async (req, res) => {
         i.RecommendedSP,
         i.Category,
         i.Brand,
-        ROUND(
-          ((i.RecommendedSP - (i.PP * 1.30)) / (i.PP * 1.30)) * 100,
-          2
-        ) AS ExtraProfitPct,
         c.CompetitorPrice,
         c.ProductURL   AS CompetitorURL,
         c.StoreName,
@@ -473,8 +469,34 @@ app.get('/api/recommendations', requireAuth, async (req, res) => {
         AND i.isInStock = 1 AND i.RecommendedSP IS NOT NULL
       ORDER BY i.SKU_ID
     `);
+    // Floor + breakdown come from the shared pricing function (same formula as
+    // everywhere else), so "Extra Profit" = how far the recommended price sits
+    // above the real floor, and the tooltip shows the real percentages.
+    const categorySettings = await loadCategorySettings(pool);
+    const rows = result.recordset.map((r) => {
+      const vars = getBusinessVars(categorySettings, r.Category, r.Brand);
+      const { baseFloor, breakdown } = computeFloor({
+        pp: parseFloat(r.PP), vars, weightKg: getProductWeightKg(r),
+      });
+      return {
+        ...r,
+        BaseFloor     : baseFloor,
+        ExtraProfitPct: baseFloor > 0
+          ? parseFloat((((r.RecommendedSP - baseFloor) / baseFloor) * 100).toFixed(2))
+          : null,
+        GSTPct        : breakdown.gstPct,
+        COBPct        : breakdown.cobPct,
+        MarginPct     : breakdown.marginPct,
+        ShopifyFeePct : breakdown.shopifyFeePct,
+        GatewayPct    : breakdown.paymentGatewayPct,
+        PackingCost   : breakdown.packingCost,
+        ShippingCost  : breakdown.shippingCost,
+        WeightKg      : breakdown.weightKg,
+      };
+    });
+
     const scope = await getUserScope(req);
-    const visibleRows = scope.filterRows(result.recordset);
+    const visibleRows = scope.filterRows(rows);
     console.log(`✅ /api/recommendations — ${visibleRows.length} rows served`);
     res.json({ success: true, data: visibleRows });
   } catch (err) {
@@ -661,17 +683,22 @@ function buildBasicRecommendationRow(product, categorySettings, competitor = nul
       GSTPct         : null,
       COBPct         : null,
       MarginPct      : null,
+      ShopifyFeePct  : null,
+      GatewayPct     : null,
+      PackingCost    : null,
+      ShippingCost   : null,
+      WeightKg       : null,
     };
   }
 
   const { effectivePP, source } = resolveEffectivePP(product);
   const vars = getBusinessVars(categorySettings, product.Category, product.Brand);
-  const { gst, costOfBusiness, profitMargin } = vars;
 
-  const { recommendedSP, baseFloor, pricingStrategy } = computeRecommendedSP({
+  const { recommendedSP, baseFloor, pricingStrategy, breakdown } = computeRecommendedSP({
     pp: effectivePP,
-    vars: { gst, costOfBusiness, profitMargin },
+    vars,                                   // GST / COB / margin + global costs
     lowestCompetitorPrice: competitor ? competitor.lowestPrice : null,
+    weightKg: getProductWeightKg(product),  // null until the weight view is wired in
   });
 
   return {
@@ -684,9 +711,15 @@ function buildBasicRecommendationRow(product, categorySettings, competitor = nul
     ExtraProfitPct : baseFloor > 0
       ? parseFloat((((recommendedSP - baseFloor) / baseFloor) * 100).toFixed(2))
       : null,
-    GSTPct         : parseFloat((gst * 100).toFixed(2)),
-    COBPct         : parseFloat((costOfBusiness * 100).toFixed(2)),
-    MarginPct      : parseFloat((profitMargin * 100).toFixed(2)),
+    // Breakdown shown in the Recommended SP tooltip
+    GSTPct         : breakdown.gstPct,
+    COBPct         : breakdown.cobPct,
+    MarginPct      : breakdown.marginPct,
+    ShopifyFeePct  : breakdown.shopifyFeePct,
+    GatewayPct     : breakdown.paymentGatewayPct,
+    PackingCost    : breakdown.packingCost,
+    ShippingCost   : breakdown.shippingCost,   // null = no weight data yet
+    WeightKg       : breakdown.weightKg,
   };
 }
 
@@ -1267,23 +1300,27 @@ app.get('/api/insights/take-action/:skuId', requireAuth, async (req, res) => {
 
     if (product.PP != null) {
       const categorySettings = await loadCategorySettings(pool);
-      const { gst, costOfBusiness, profitMargin } = getBusinessVars(categorySettings, product.Category, product.Brand);
+      const vars = getBusinessVars(categorySettings, product.Category, product.Brand);
+
+      // Same shared formula as every other table (with or without a competitor).
+      const calc = computeRecommendedSP({
+        pp: parseFloat(product.PP),
+        vars,
+        lowestCompetitorPrice: lowestCompetitorPrice != null ? parseFloat(lowestCompetitorPrice) : null,
+        weightKg: getProductWeightKg(product),
+      });
+      recommendedSP = calc.recommendedSP;
 
       pricingBreakdown = {
-        gstPct: Math.round(gst * 10000) / 100,
-        costOfBusinessPct: Math.round(costOfBusiness * 10000) / 100,
-        profitMarginPct: Math.round(profitMargin * 10000) / 100,
+        gstPct            : calc.breakdown.gstPct,
+        costOfBusinessPct : calc.breakdown.cobPct,
+        profitMarginPct   : calc.breakdown.marginPct,
+        shopifyFeePct     : calc.breakdown.shopifyFeePct,
+        paymentGatewayPct : calc.breakdown.paymentGatewayPct,
+        packingCost       : calc.breakdown.packingCost,
+        shippingCost      : calc.breakdown.shippingCost,   // null = no weight data yet
+        weightKg          : calc.breakdown.weightKg,
       };
-
-      if (lowestCompetitorPrice != null) {
-        const { recommendedSP: sp } = calculateRecommendedPrice(
-          parseFloat(product.PP), parseFloat(lowestCompetitorPrice), gst, costOfBusiness, profitMargin
-        );
-        recommendedSP = sp;
-      } else {
-        const multiplier = 1 + gst + costOfBusiness + profitMargin;
-        recommendedSP = Math.round(parseFloat(product.PP) * multiplier);
-      }
 
       // Keep InternalProducts.RecommendedSP in sync with what this modal shows,
       // so the variance check on push compares against the same number.
